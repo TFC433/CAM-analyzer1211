@@ -5,52 +5,39 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import numpy as np
-import platform
 
 class ChartManager:
     def __init__(self, parent_frame, theme_manager):
         self.parent = parent_frame
         self.tm = theme_manager
-        self.font_size = self.tm.fonts['main'][1]
         
-        # --- [字型修復] ---
-        system_name = platform.system()
-        if system_name == "Windows":
-            font_list = ['Microsoft JhengHei', 'SimHei', 'Arial']
-        elif system_name == "Darwin":
-            font_list = ['Arial Unicode MS', 'PingFang TC']
-        else:
-            font_list = ['WenQuanYi Micro Hei', 'Droid Sans Fallback']
-            
-        plt.rcParams['font.sans-serif'] = font_list + plt.rcParams['font.sans-serif']
+        # 設定 Matplotlib 字型 (容錯機制)
+        font_list = [self.tm.font_family, 'Microsoft JhengHei', 'SimHei', 'Arial', 'sans-serif']
+        plt.rcParams['font.sans-serif'] = font_list
         plt.rcParams['axes.unicode_minus'] = False
-        # -----------------
-
-        self.current_scale_hist = 1.0
         
+        self.colors = self.tm.get_color_palette()
+        
+        # 初始化圖表
         self.fig_width = 8
         self.fig_height = 5
-        self.figure, self.ax = plt.subplots(figsize=(self.fig_width, self.fig_height), dpi=80)
+        self.figure, self.ax = plt.subplots(figsize=(self.fig_width, self.fig_height), dpi=96)
+        
+        # 設定深色背景
+        self.figure.patch.set_facecolor(self.colors['bg_card'])
+        self.ax.set_facecolor(self.colors['bg_card'])
         
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.parent)
         self.canvas.get_tk_widget().pack(fill="both", expand=True)
         
-        self.toolbar = NavigationToolbar2Tk(self.canvas, self.parent, pack_toolbar=False)
-        self.toolbar.pack(pady=5, fill="x")
-        self._customize_toolbar()
-        
-        self.tooltip = None
         self.canvas.mpl_connect("motion_notify_event", self.on_hover)
         self.canvas.mpl_connect("scroll_event", self.on_scroll)
         
         self.bars = None
         self.hist_data = None
-        self.last_plot_args = None 
-
-    def _customize_toolbar(self):
-        for tool_name in ['Back', 'Forward', 'Subplots']:
-            self.toolbar.toolitems = [t for t in self.toolbar.toolitems if t[0] != tool_name]
-        self.toolbar.update()
+        self.last_plot_args = None
+        self.current_scale_hist = 1.0
+        self.tooltip = None # 懸停提示框
 
     def update_size(self, width_inch, height_inch):
         self.figure.set_size_inches(width_inch, height_inch)
@@ -70,12 +57,15 @@ class ChartManager:
         self.last_plot_args = (distances, bins, fixed_intervals)
         
         self.ax.clear()
-        colors = self.tm.get_color_palette()
-        self.figure.set_facecolor(colors['bg'])
-        self.ax.set_facecolor(colors['bg'])
+        self.ax.set_facecolor(self.colors['bg_card'])
+        
+        c_fg = self.colors['fg_main']
+        c_grid = self.colors['grid']
+        c_bar = self.colors['accent']
+        c_star = self.colors['star']
         
         if not distances:
-            self.ax.text(0.5, 0.5, '無數據', ha='center', va='center', color=colors['fg'])
+            self.ax.text(0.5, 0.5, '無數據', ha='center', va='center', color=c_fg)
             self.canvas.draw()
             return
 
@@ -83,116 +73,107 @@ class ChartManager:
         self.hist_data = hist
         
         labels = [
-            f"{s:.3f}<=間距<{e:.3f}" if e != float('inf') else f"{s:.3f}<間距"
+            f"{s:.3f}<=D<{e:.3f}" if e != float('inf') else f"{s:.3f}<D"
             for s, e in fixed_intervals
         ]
         
-        counts = hist
-        
+        # 計算 Top 10
         total_segments = len(distances)
-        percentages = [count / total_segments * 100 if total_segments > 0 else 0 for count in counts]
-        percentages_with_index = [(percent, idx) for idx, percent in enumerate(percentages)]
+        percentages = [count / total_segments * 100 if total_segments > 0 else 0 for count in hist]
+        percentages_with_index = [(pct, idx) for idx, pct in enumerate(percentages)]
         top_10 = sorted(percentages_with_index, key=lambda x: x[0], reverse=True)[:10]
         top_10_indices = [idx for _, idx in top_10]
         top_10_ranks = {idx: rank + 1 for rank, idx in enumerate(top_10_indices)}
         max_idx = top_10_indices[0] if top_10_indices else 0
 
         y_pos = np.arange(len(labels))
-        self.bars = self.ax.barh(y_pos, counts * self.current_scale_hist, align='center', 
-                                color=colors['bar'], edgecolor=colors['inactive'], alpha=0.8, height=0.8)
+        
+        # 繪製 Bar
+        self.bars = self.ax.barh(y_pos, hist * self.current_scale_hist, align='center', 
+                                color=c_bar, edgecolor=self.colors['bg_card'], alpha=0.8, height=0.7)
         
         self.ax.set_yticks(y_pos)
-        self.ax.set_yticklabels(labels, fontsize=self.font_size, color=colors['fg'])
-        self.ax.set_xlabel('單節數', fontsize=self.font_size, color=colors['fg'])
-        self.ax.set_title('G01 移動距離分佈', fontsize=self.font_size + 2, pad=15, color=colors['fg'])
-        self.ax.grid(True, alpha=0.3, linestyle='--', color=colors['grid'])
+        self.ax.set_yticklabels(labels, fontsize=10, color=c_fg)
+        self.ax.set_xlabel('單節數量 (Count)', fontsize=10, color=c_fg)
         
-        max_count = max(counts * self.current_scale_hist) if max(counts) > 0 else 1
-        x_max = max_count * 1.4
+        self.ax.tick_params(axis='x', colors=c_fg)
+        self.ax.tick_params(axis='y', colors=c_fg)
+        
+        # 邊框與格線
+        self.ax.spines['top'].set_visible(False)
+        self.ax.spines['right'].set_visible(False)
+        self.ax.spines['bottom'].set_color(c_grid)
+        self.ax.spines['left'].set_color(c_grid)
+        self.ax.grid(True, axis='x', alpha=0.2, linestyle='--', color=c_grid)
+
+        # 設定 X 軸範圍 (留空間給標籤)
+        max_val = max(hist) if max(hist) > 0 else 1
+        x_max = max_val * (1.4 * self.current_scale_hist)
         self.ax.set_xlim(0, x_max)
 
+        # [修復] 繪製 Top 10 標籤與虛線
         for i, bar in enumerate(self.bars):
             width = bar.get_width()
             percentage = percentages[i]
-            text = f'{percentage:.2f}%'
+            text = f'{percentage:.1f}%'
             if i == max_idx:
                 text += ' ★'
             
+            # 文字位置
             text_x = width + (0.02 * x_max)
-            self.ax.text(text_x, bar.get_y() + bar.get_height()/2, 
-                        text, ha='left', va='center', fontsize=self.font_size, 
-                        color=colors['star'] if i == max_idx else colors['fg'], weight='bold')
+            bar_y = bar.get_y() + bar.get_height() / 2
             
+            # 顯示百分比文字
+            self.ax.text(text_x, bar_y, text, 
+                        ha='left', va='center', fontsize=9, 
+                        color=c_star if i == max_idx else c_fg, weight='bold')
+            
+            # 如果是 Top 10，畫虛線與排名
             if i in top_10_indices:
-                bar_y = bar.get_y() + bar.get_height() / 2
-                text_len_est = len(text) * (x_max * 0.02) 
-                line_start = text_x + text_len_est + (0.01 * x_max)
+                # 簡單估算文字寬度避免重疊
+                text_len_est = len(text) * (x_max * 0.025) 
+                line_start = text_x + text_len_est
                 
                 self.ax.plot([line_start, x_max], [bar_y, bar_y], 
-                            color=colors['star'], linestyle='--', linewidth=1, alpha=0.7)
+                            color=c_star, linestyle='--', linewidth=0.8, alpha=0.5)
                 
                 rank = top_10_ranks[i]
                 self.ax.text(x_max, bar_y, f'Top{rank}', 
-                            ha='right', va='center', fontsize=self.font_size, 
-                            color=colors['star'], weight='bold')
+                            ha='right', va='center', fontsize=9, 
+                            color=c_star, weight='bold')
 
-        self.ax.tick_params(axis='x', colors=colors['fg'])
         self.figure.tight_layout()
         self.canvas.draw()
 
     def plot_f_curve(self, x_values, f_values, t_value, max_dist, hist_data, fixed_intervals):
         self.ax.clear()
-        colors = self.tm.get_color_palette()
-        self.figure.set_facecolor(colors['bg'])
-        self.ax.set_facecolor(colors['bg'])
-
+        self.ax.set_facecolor(self.colors['bg_card'])
+        
+        c_fg = self.colors['fg_main']
+        c_grid = self.colors['grid']
+        c_line = self.colors['line']
+        
         if x_values is None:
-            self.ax.text(0.5, 0.5, '無效的 L 或 T 值', ha='center', color=colors['fg'])
+            self.ax.text(0.5, 0.5, '無效數據', ha='center', color=c_fg)
             self.canvas.draw()
             return
 
-        if hist_data is not None and len(hist_data) > 0:
-            max_idx = np.argmax(hist_data)
-            max_interval = fixed_intervals[max_idx]
-            start_x, end_x = max_interval
-            if end_x == float('inf'): end_x = max_dist
-            if end_x > max_dist: end_x = max_dist
-            if start_x < 0.001: start_x = 0.001
-
-            start_f = (start_x / t_value) * 60000
-            end_f = (end_x / t_value) * 60000
-
-            mask1 = (x_values < start_x)
-            mask2 = (x_values >= start_x) & (x_values <= end_x)
-            mask3 = (x_values > end_x)
-            
-            if np.any(mask1): self.ax.plot(x_values[mask1], f_values[mask1], color=colors['inactive'], linewidth=2)
-            if np.any(mask2): self.ax.plot(x_values[mask2], f_values[mask2], color=colors['line'], linewidth=2)
-            if np.any(mask3): self.ax.plot(x_values[mask3], f_values[mask3], color=colors['inactive'], linewidth=2)
-
-            self.ax.axvline(x=start_x, color=colors['line'], linestyle='--', alpha=0.7)
-            self.ax.axvline(x=end_x, color=colors['line'], linestyle='--', alpha=0.7)
-            self.ax.axhline(y=start_f, color=colors['line'], linestyle='--', alpha=0.7)
-            self.ax.axhline(y=end_f, color=colors['line'], linestyle='--', alpha=0.7)
-            
-            mid_x = (start_x + end_x) / 2
-            mid_f = (mid_x / t_value) * 60000
-            self.ax.text(mid_x, mid_f, '★', fontsize=self.font_size + 4, color=colors['star'], ha='center', va='bottom')
-
-        else:
-            self.ax.plot(x_values, f_values, color=colors['line'], linewidth=2)
+        self.ax.plot(x_values, f_values, color=c_line, linewidth=2)
         
-        self.ax.set_xlabel('L (mm or deg)', fontsize=self.font_size, color=colors['fg'])
-        self.ax.set_ylabel('F (mm/min)', fontsize=self.font_size, color=colors['fg'])
-        self.ax.set_title('微小單節處理能力', fontsize=self.font_size + 2, pad=15, color=colors['fg'])
-        self.ax.grid(True, alpha=0.3, linestyle='--', color=colors['grid'])
-        self.ax.set_xlim(0.001, max_dist)
-        self.ax.set_ylim(0, max(f_values) * 1.2 if len(f_values) > 0 else 1)
-        self.ax.tick_params(axis='both', colors=colors['fg'])
+        self.ax.set_xlabel('Length (mm)', color=c_fg)
+        self.ax.set_ylabel('Feed (mm/min)', color=c_fg)
+        
+        self.ax.tick_params(axis='both', colors=c_fg)
+        self.ax.spines['top'].set_visible(False)
+        self.ax.spines['right'].set_visible(False)
+        self.ax.spines['bottom'].set_color(c_grid)
+        self.ax.spines['left'].set_color(c_grid)
+        self.ax.grid(True, alpha=0.2, linestyle='--', color=c_grid)
         
         self.figure.tight_layout()
         self.canvas.draw()
 
+    # [修復] 滑鼠懸停顯示單節數
     def on_hover(self, event):
         if event.inaxes != self.ax or self.bars is None:
             if self.tooltip: self.tooltip.destroy()
@@ -201,10 +182,11 @@ class ChartManager:
         for i, bar in enumerate(self.bars):
             if bar.contains(event)[0]:
                 count = self.hist_data[i]
-                self._show_tooltip(event, f"單節數: {count}")
+                self._show_tooltip(event, f"數量: {count} 筆")
                 return
         
-        if self.tooltip: self.tooltip.destroy()
+        if self.tooltip:
+            self.tooltip.destroy()
 
     def _show_tooltip(self, event, text):
         if self.tooltip: self.tooltip.destroy()
