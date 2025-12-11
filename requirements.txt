@@ -1,0 +1,6 @@
+numpy
+matplotlib
+ttkbootstrap
+chardet
+darkdetect
+tkinterdnd2
