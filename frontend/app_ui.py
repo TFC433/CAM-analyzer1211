@@ -16,7 +16,7 @@ class CAMApp:
         self.root = root
         
         self.APP_NAME = "CAM Analyzer"
-        self.APP_VERSION = "v7.3 (Final)"
+        self.APP_VERSION = "v7.6 (TCP Vector Mode)"
         self.root.title(f"{self.APP_NAME} {self.APP_VERSION}")
         
         self.tm = ThemeManager(root)
@@ -39,6 +39,7 @@ class CAMApp:
         self.detailed_logs = []
         self.top_10_stats = []
         self.top_3_stats = []
+        self.current_calc_mode = "" 
         
         # 直方圖 Bin 設定
         self.fixed_intervals = [
@@ -108,16 +109,25 @@ class CAMApp:
         self.lbl_filename = ttk.Label(header_inner, text="尚未載入", style='Header.TLabel')
         self.lbl_filename.pack(anchor='w', pady=(0, 10))
         
-        # 2. 軸向
-        axis_row = ttk.Frame(header_inner, style='Card.TFrame')
-        axis_row.pack(anchor='w')
-        ttk.Label(axis_row, text="偵測軸向: ", style='CardLabel.TLabel').pack(side='left')
+        # 2. 軸向與模式
+        self.axis_row = ttk.Frame(header_inner, style='Card.TFrame')
+        self.axis_row.pack(anchor='w')
+        ttk.Label(self.axis_row, text="偵測軸向: ", style='CardLabel.TLabel').pack(side='left')
         
         self.axis_indicators = {}
-        for ax in ['X', 'Y', 'Z', 'A', 'B', 'C']:
-            lbl = ttk.Label(axis_row, text=ax, style='AxisInactive.TLabel', width=3, anchor='center')
-            lbl.pack(side='left', padx=2)
+        # 預先建立所有標籤，但稍後再透過 pack 控制顯示順序與隱藏
+        for ax in ['X', 'Y', 'Z', 'A', 'B', 'C', 'I', 'J', 'K']:
+            lbl = ttk.Label(self.axis_row, text=ax, style='AxisInactive.TLabel', width=3, anchor='center')
+            # 這裡不先 pack，改在 update_results 動態決定
             self.axis_indicators[ax] = lbl
+            
+        # 預設先顯示 X~C，隱藏 IJK
+        for ax in ['X', 'Y', 'Z', 'A', 'B', 'C']:
+            self.axis_indicators[ax].pack(side='left', padx=2)
+
+        # [模式顯示標籤]
+        self.lbl_calc_mode = ttk.Label(self.axis_row, text="", style='Inverse.TLabel', font=self.tm.fonts['ui_bold'])
+        self.lbl_calc_mode.pack(side='left', padx=(20, 0))
 
         # 3. 進度條
         self.progress = ttk.Progressbar(self.header, mode='determinate', bootstyle='success-striped', style='Thick.Horizontal.TProgressbar')
@@ -256,7 +266,9 @@ class CAMApp:
             self.status_var.set("已載入，等待分析")
             
             for k in self.kpi_vals: self.kpi_vals[k].config(text="--")
+            # 檔案載入時，先將燈號重置為不活躍 (不改變顯示結構)
             for lbl in self.axis_indicators.values(): lbl.configure(style='AxisInactive.TLabel')
+            self.lbl_calc_mode.config(text="")
             self.txt_detail.delete(1.0, tk.END)
             self.txt_log.delete(1.0, tk.END)
 
@@ -307,7 +319,8 @@ class CAMApp:
                 "detailed_logs": data["detailed_logs"],
                 "top10": top10,
                 "top3": top3,
-                "bpt": bpt
+                "bpt": bpt,
+                "calc_mode": data["calc_mode"]
             }
             self.msg_queue.put(("DONE", result_payload))
 
@@ -362,10 +375,41 @@ class CAMApp:
         self.detailed_logs = data["detailed_logs"]
         self.top_10_stats = data["top10"]
         self.top_3_stats = data["top3"]
+        self.current_calc_mode = data["calc_mode"]
         
-        # 1. 軸向
-        for ax in self.detected_axes:
-            self.axis_indicators[ax].configure(style='AxisActive.TLabel')
+        # 1. 軸向燈號 (動態顯示控制)
+        # 先全部隱藏 (unpack)
+        for lbl in self.axis_indicators.values():
+            lbl.pack_forget()
+            lbl.configure(style='AxisInactive.TLabel')
+            
+        # 決定要顯示哪些燈號
+        # 基礎: X Y Z A B C (永遠顯示位置，只是狀態不同)
+        visible_axes = ['X', 'Y', 'Z', 'A', 'B', 'C']
+        
+        # 如果是 TCP 模式，追加 I J K
+        is_tcp = "TCP" in self.current_calc_mode
+        if is_tcp:
+            visible_axes.extend(['I', 'J', 'K'])
+            
+        # 依照固定順序 pack 回去
+        for ax in visible_axes:
+            self.axis_indicators[ax].pack(side='left', padx=2)
+            # 如果該軸真的在偵測列表中，亮燈
+            if ax in self.detected_axes:
+                self.axis_indicators[ax].configure(style='AxisActive.TLabel')
+
+        # 確保模式標籤還在最後面
+        self.lbl_calc_mode.pack_forget()
+        self.lbl_calc_mode.pack(side='left', padx=(20, 0))
+            
+        self.lbl_calc_mode.config(text=f"[ {self.current_calc_mode} ]")
+        if is_tcp:
+            # 亮色顯示 TCP 模式
+            self.lbl_calc_mode.configure(foreground=self.colors['accent'])
+        else:
+            # 預設顏色顯示一般模式
+            self.lbl_calc_mode.configure(foreground=self.colors['fg_main'])
             
         # 2. KPI - Row 1
         total = self.stats["g00"] + self.stats["g01"]
@@ -395,6 +439,7 @@ class CAMApp:
                 self.kpi_vals[key].config(text="--")
 
         # 3. Log
+        self.txt_log.insert(tk.END, f"=== 分析模式: {self.current_calc_mode} ===\n")
         self.txt_log.insert(tk.END, "=== 分析完成: 略過(G01)/警告/指令列表 ===\n")
         self.txt_log.insert(tk.END, "(已過濾正常 G01 移動，僅顯示非切削與異常指令)\n\n")
         MAX_LOG = 5000
@@ -419,6 +464,7 @@ class CAMApp:
         if not self.detailed_logs: return
         self.txt_detail.delete(1.0, tk.END)
         
+        self.txt_detail.insert(tk.END, f"=== Mode: {self.current_calc_mode} ===\n")
         self.txt_detail.insert(tk.END, "=== Top 10 Distribution Stats ===\n")
         for i, item in enumerate(self.top_10_stats):
             bar = "|" * int(item['pct'] / 2)
@@ -428,24 +474,49 @@ class CAMApp:
         limit_str = self.combo_limit.get()
         limit = len(self.detailed_logs) if limit_str == "全部" else int(limit_str)
         
-        # 動態表頭: Start/End 根據偵測到的軸向顯示
-        active_axes_str = "".join(self.detected_axes)
-        header_start = f"Start ({active_axes_str})"
-        header_end = f"End ({active_axes_str})"
+        # === 動態表頭生成 (易讀性優化) ===
+        # 1. 決定要顯示哪些軸
+        all_axes_priority = ['X', 'Y', 'Z', 'A', 'B', 'C', 'I', 'J', 'K']
+        active_cols = [ax for ax in all_axes_priority if ax in self.detected_axes]
         
-        self.txt_detail.insert(tk.END, f"{'Line':<6} | {header_start:<25} | {header_end:<25} | {'Dist':<8} | {'Feed':<6} | {'Info'}\n")
-        self.txt_detail.insert(tk.END, "-"*100 + "\n")
+        # 2. 生成易讀標題 (使用 Start_X, End_X)
+        header_start_parts = [f"Start_{ax}" for ax in active_cols]
+        header_end_parts = [f"End_{ax}" for ax in active_cols]
+        header_start = " ".join(header_start_parts)
+        header_end = " ".join(header_end_parts)
         
-        axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
-        active_indices = [axis_map[ax] for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
+        # 3. 決定距離欄位 (依照模式)
+        is_tcp = "TCP" in self.current_calc_mode
+        if is_tcp:
+            dist_header = f"{'XYZ_Dist':<8} | {'Rot_Deg':<7} | {'Total_Dist':<10}"
+        else:
+            dist_header = f"{'Dist':<8}"
+
+        self.txt_detail.insert(tk.END, f"{'Line':<6} | {header_start:<30} | {header_end:<30} | {dist_header} | {'Feed':<6} | {'Info'}\n")
+        self.txt_detail.insert(tk.END, "-"*140 + "\n")
+        
+        axis_map_full = {ax: i for i, ax in enumerate(all_axes_priority)}
+        active_indices = [axis_map_full[ax] for ax in active_cols]
         
         count = 0
         buffer = ""
         for log in self.detailed_logs:
             if count >= limit: break
+            
+            # 取出 Start / End 對應欄位的數值
             s_str = " ".join([f"{log['start'][i]:.1f}" for i in active_indices])
             e_str = " ".join([f"{log['end'][i]:.1f}" for i in active_indices])
-            buffer += f"{log['line']:<6} | {s_str:<25} | {e_str:<25} | {log['dist']:<8.3f} | {int(log['feed']):<6} | {log['info']}\n"
+            
+            # 取出距離數值
+            if is_tcp:
+                d_xyz = log.get('dist_xyz', 0.0)
+                r_deg = log.get('rot_deg', 0.0)
+                d_total = log['dist']
+                dist_str = f"{d_xyz:<8.3f} | {r_deg:<7.1f} | {d_total:<10.3f}"
+            else:
+                dist_str = f"{log['dist']:<8.3f}"
+
+            buffer += f"{log['line']:<6} | {s_str:<30} | {e_str:<30} | {dist_str} | {int(log['feed']):<6} | {log['info']}\n"
             count += 1
             if count % 500 == 0:
                 self.txt_detail.insert(tk.END, buffer)
@@ -474,17 +545,36 @@ class CAMApp:
                 self.msg_queue.put(("STATUS", "正在匯出 CSV..."))
                 with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f)
-                    active_axes = [ax for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
-                    s_headers = [f"Start_{ax}" for ax in active_axes]
-                    e_headers = [f"End_{ax}" for ax in active_axes]
-                    writer.writerow(["Line"] + s_headers + e_headers + ["Dist", "Feed", "Info"])
-                    axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
-                    idxs = [axis_map[ax] for ax in active_axes]
+                    
+                    all_axes_priority = ['X', 'Y', 'Z', 'A', 'B', 'C', 'I', 'J', 'K']
+                    active_cols = [ax for ax in all_axes_priority if ax in self.detected_axes]
+                    
+                    # 使用易讀標題
+                    s_headers = [f"Start_{ax}" for ax in active_cols]
+                    e_headers = [f"End_{ax}" for ax in active_cols]
+                    
+                    is_tcp = "TCP" in self.current_calc_mode
+                    if is_tcp:
+                        dist_headers = ["XYZ_Dist", "Rot_Deg", "Total_Dist"]
+                    else:
+                        dist_headers = ["Dist"]
+                        
+                    writer.writerow(["Line", "Mode"] + s_headers + e_headers + dist_headers + ["Feed", "Info"])
+                    
+                    axis_map_full = {ax: i for i, ax in enumerate(all_axes_priority)}
+                    active_indices = [axis_map_full[ax] for ax in active_cols]
+                    
                     rows = []
                     for l in self.detailed_logs:
-                        s_v = [l['start'][i] for i in idxs]
-                        e_v = [l['end'][i] for i in idxs]
-                        rows.append([l['line']] + s_v + e_v + [l['dist'], l['feed'], l['info']])
+                        s_v = [l['start'][i] for i in active_indices]
+                        e_v = [l['end'][i] for i in active_indices]
+                        
+                        if is_tcp:
+                            d_vals = [l.get('dist_xyz', 0), l.get('rot_deg', 0), l['dist']]
+                        else:
+                            d_vals = [l['dist']]
+                            
+                        rows.append([l['line'], self.current_calc_mode] + s_v + e_v + d_vals + [l['feed'], l['info']])
                     writer.writerows(rows)
                 self.msg_queue.put(("STATUS", "匯出完成"))
                 messagebox.showinfo("成功", "匯出完成")
