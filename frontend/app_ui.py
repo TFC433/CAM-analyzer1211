@@ -2,9 +2,10 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import ttkbootstrap as ttk
 import os
-import numpy as np
 import csv
-import time  # [修正] 補上 time，用於暫停功能
+import time
+import threading
+import queue
 
 from backend import GCodeAnalyzer
 from frontend.styles import ThemeManager
@@ -13,30 +14,33 @@ from frontend.charts import ChartManager
 class CAMApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CAM Analyzer Pro v4.2")
         
-        # 1. 初始化樣式與色票
+        self.APP_NAME = "CAM Analyzer"
+        self.APP_VERSION = "v7.3 (Final)"
+        self.root.title(f"{self.APP_NAME} {self.APP_VERSION}")
+        
         self.tm = ThemeManager(root)
         self.colors = self.tm.get_color_palette() 
         
         self.engine = GCodeAnalyzer()
+        self.msg_queue = queue.Queue()
         
-        # 狀態變數
+        # 狀態
         self.file_path = None
         self.is_running = False
         self.is_paused = False
         self.should_stop = False
-        self.current_view = "dashboard"
+        self.status_var = tk.StringVar(value="就緒")
         
-        # 數據變數
-        self.stats = {"g00": 0.0, "g01": 0.0}
+        # 數據
+        self.stats = {"g00": 0.0, "g01": 0.0, "time": 0.0}
         self.cached_distances = []
         self.detected_axes = []
-        self.skipped_lines = []
-        self.cached_starts = []
-        self.cached_ends = []
+        self.detailed_logs = []
+        self.top_10_stats = []
+        self.top_3_stats = []
         
-        # 直方圖區間設定
+        # 直方圖 Bin 設定
         self.fixed_intervals = [
             (0.000, 0.001), (0.001, 0.01), (0.01, 0.02), (0.02, 0.03), 
             (0.03, 0.04), (0.04, 0.05), (0.05, 0.06), (0.06, 0.07), 
@@ -47,232 +51,201 @@ class CAMApp:
         ]
         self.bins = [i[0] for i in self.fixed_intervals] + [self.fixed_intervals[-1][1]]
         
-        # 初始化介面
         self._init_layout()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.check_queue() 
 
     def _init_layout(self):
-        # 設定 Grid 權重：左側固定，右側延伸
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
 
-        # === 1. 左側導航欄 (Sidebar) ===
-        self.sidebar = ttk.Frame(self.root, style='Sidebar.TFrame', padding=10, width=240)
+        # === 左側 Sidebar ===
+        self.sidebar = ttk.Frame(self.root, style='Sidebar.TFrame', padding=20, width=250)
         self.sidebar.grid(row=0, column=0, sticky='ns')
-        self.sidebar.grid_propagate(False) # 固定寬度
+        self.sidebar.grid_propagate(False)
 
-        # Logo 區域
-        ttk.Label(self.sidebar, text="CAM ANALYZER", style='Inverse.TLabel', 
-                  font=self.tm.fonts['h1']).pack(pady=(20, 30), anchor='w')
+        ttk.Label(self.sidebar, text=self.APP_NAME, style='Inverse.TLabel', 
+                  font=self.tm.fonts['h1']).pack(pady=(10, 40), anchor='center')
 
-        # 操作區 (Actions)
         ttk.Label(self.sidebar, text="操作", style='Inverse.TLabel', font=self.tm.fonts['h2']).pack(anchor='w', pady=(0, 10))
-        
         self.btn_open = ttk.Button(self.sidebar, text="📂 開啟檔案", bootstyle="success", command=self.select_file)
         self.btn_open.pack(fill='x', pady=5)
-        
         self.btn_analyze = ttk.Button(self.sidebar, text="▶ 開始分析", bootstyle="primary", 
-                                      state='disabled', command=self.start_analysis)
+                                      state='disabled', command=self.start_analysis_thread)
         self.btn_analyze.pack(fill='x', pady=5)
 
-        # 控制按鈕 (暫停/停止)
         ctrl_frame = ttk.Frame(self.sidebar, style='Sidebar.TFrame')
         ctrl_frame.pack(fill='x', pady=5)
-        
-        self.btn_pause = ttk.Button(ctrl_frame, text="暫停", bootstyle="warning", width=4, 
-                                    state='disabled', command=self.toggle_pause)
+        self.btn_pause = ttk.Button(ctrl_frame, text="暫停", bootstyle="warning", width=4, state='disabled', command=self.toggle_pause)
         self.btn_pause.pack(side='left', fill='x', expand=True, padx=(0, 2))
-        
-        self.btn_stop = ttk.Button(ctrl_frame, text="停止", bootstyle="danger", width=4, 
-                                   state='disabled', command=self.stop_analysis)
+        self.btn_stop = ttk.Button(ctrl_frame, text="停止", bootstyle="danger", width=4, state='disabled', command=self.stop_analysis)
         self.btn_stop.pack(side='right', fill='x', expand=True, padx=(2, 0))
 
         ttk.Separator(self.sidebar).pack(fill='x', pady=20)
 
-        # 導航區 (Views)
+        # 視圖按鈕
         ttk.Label(self.sidebar, text="視圖", style='Inverse.TLabel', font=self.tm.fonts['h2']).pack(anchor='w', pady=(0, 10))
-        
         self.nav_btns = {}
-        # 定義導航按鈕 (key, icon, label)
-        for key, icon, label in [('dashboard', '📊', '儀表板'), ('table', '📝', '詳細數據'), ('code', '📜', '原始碼')]:
+        for key, icon, label in [('dashboard', '📊', '儀表板'), ('detail', '📝', '詳細數據'), ('log', '📜', 'LOG紀錄')]:
             btn = ttk.Button(self.sidebar, text=f"{icon}  {label}", style='Nav.TButton',
                              command=lambda k=key: self.switch_view(k))
             btn.pack(fill='x', pady=2)
             self.nav_btns[key] = btn
 
-        # === 2. 右側內容區 (Main Content) ===
-        self.content = ttk.Frame(self.root, padding=20)
-        self.content.grid(row=0, column=1, sticky='nsew')
+        # === 右側 Main Area ===
+        self.main_area = ttk.Frame(self.root)
+        self.main_area.grid(row=0, column=1, sticky='nsew')
         
-        # [修改] 頂部狀態列 (Header) 佈局調整
-        header_frame = ttk.Frame(self.content)
-        header_frame.pack(fill='x', pady=(0, 20))
+        # --- Top: Header ---
+        self.header = ttk.Frame(self.main_area, padding=0, style='Card.TFrame') 
+        self.header.pack(fill='x')
         
-        # 上層：檔名 + 燈號
-        info_frame = ttk.Frame(header_frame)
-        info_frame.pack(fill='x', pady=(0, 5))
+        header_inner = ttk.Frame(self.header, padding=(20, 15), style='Card.TFrame')
+        header_inner.pack(fill='x')
 
-        self.lbl_filename = ttk.Label(info_frame, text="尚未載入檔案", font=self.tm.fonts['h1'], foreground=self.colors['fg_main'])
-        self.lbl_filename.pack(side='left', padx=(0, 15))
+        # 1. 檔名
+        ttk.Label(header_inner, text="當前檔案", style='CardLabel.TLabel').pack(anchor='w')
+        self.lbl_filename = ttk.Label(header_inner, text="尚未載入", style='Header.TLabel')
+        self.lbl_filename.pack(anchor='w', pady=(0, 10))
         
-        # 軸向燈號區 (移到左邊，緊接在檔名後面)
-        axis_frame = ttk.Frame(info_frame)
-        axis_frame.pack(side='left')
+        # 2. 軸向
+        axis_row = ttk.Frame(header_inner, style='Card.TFrame')
+        axis_row.pack(anchor='w')
+        ttk.Label(axis_row, text="偵測軸向: ", style='CardLabel.TLabel').pack(side='left')
+        
         self.axis_indicators = {}
         for ax in ['X', 'Y', 'Z', 'A', 'B', 'C']:
-            lbl = ttk.Label(axis_frame, text=ax, style='AxisInactive.TLabel', width=3)
+            lbl = ttk.Label(axis_row, text=ax, style='AxisInactive.TLabel', width=3, anchor='center')
             lbl.pack(side='left', padx=2)
             self.axis_indicators[ax] = lbl
 
-        # [修改] 下層：進度條 (在檔名下方)
-        self.progress = ttk.Progressbar(header_frame, mode='determinate', bootstyle='success-striped')
-        self.progress.pack(fill='x', pady=(0, 5))
+        # 3. 進度條
+        self.progress = ttk.Progressbar(self.header, mode='determinate', bootstyle='success-striped', style='Thick.Horizontal.TProgressbar')
+        self.progress.pack(fill='x', side='bottom')
+        self.tm.style.configure('Thick.Horizontal.TProgressbar', thickness=10)
 
-        # 視圖容器 (View Container)
+        # --- Center: 內容 ---
+        self.content = ttk.Frame(self.main_area, padding=20)
+        self.content.pack(fill='both', expand=True)
         self.view_container = ttk.Frame(self.content)
         self.view_container.pack(fill='both', expand=True)
         
-        # 初始化三個子視圖
         self._init_dashboard()
-        self._init_table()
-        self._init_code()
+        self._init_detail_text()
+        self._init_log()
         
-        # 預設顯示儀表板
+        # --- Bottom: 狀態列 ---
+        self.statusbar = ttk.Frame(self.main_area, padding=(10, 5), style='Sidebar.TFrame')
+        self.statusbar.pack(fill='x', side='bottom')
+        self.lbl_status = ttk.Label(self.statusbar, textvariable=self.status_var, style='Inverse.TLabel')
+        self.lbl_status.pack(side='left')
+
         self.switch_view('dashboard')
 
     def _init_dashboard(self):
-        """初始化儀表板視圖 (KPI + 圖表)"""
         self.view_dash = ttk.Frame(self.view_container)
         
-        # KPI Cards 區域
-        kpi_frame = ttk.Frame(self.view_dash)
-        kpi_frame.pack(fill='x', pady=(0, 20))
+        # Row 1
+        row1 = ttk.Frame(self.view_dash)
+        row1.pack(fill='x', pady=(0, 10))
+        for i in range(4): row1.grid_columnconfigure(i, weight=1)
         
         self.kpi_vals = {}
-        kpi_defs = [
-            ('total', '總行程'), 
-            ('g01', 'G01 切削距離 (佔比)'), 
-            ('g00', 'G00 空跑距離 (佔比)')
+        kpi_defs_r1 = [
+            (0, 'total', '總行程 (Total)'), 
+            (1, 'g01', 'G01 切削距離'), 
+            (2, 'g00', 'G00 空跑距離'),
+            (3, 'time', '預估切削時間')
         ]
         
-        for i, (key, title) in enumerate(kpi_defs):
-            # 卡片容器
-            card = ttk.Frame(kpi_frame, style='Card.TFrame', padding=15)
-            card.pack(side='left', fill='x', expand=True, padx=(0 if i==0 else 10, 0))
-            
-            # 卡片內容
+        for col_idx, key, title in kpi_defs_r1:
+            card = ttk.Frame(row1, style='Card.TFrame', padding=15)
+            card.grid(row=0, column=col_idx, sticky='nsew', padx=(0 if col_idx==0 else 10, 0))
             ttk.Label(card, text=title, style='CardLabel.TLabel').pack(anchor='w')
             val = ttk.Label(card, text="--", style='CardValue.TLabel')
             val.pack(anchor='w', pady=(5, 0))
             self.kpi_vals[key] = val
 
-        # 圖表區域 (含分頁)
+        # Row 2
+        row2 = ttk.Frame(self.view_dash)
+        row2.pack(fill='x', pady=(0, 20))
+        for i in range(4): row2.grid_columnconfigure(i, weight=1)
+
+        kpi_defs_r2 = [
+            (0, 'bpt', '最適合 BPT (以上)'),
+            (1, 'top1', 'Top 1 分佈'),
+            (2, 'top2', 'Top 2 分佈'),
+            (3, 'top3', 'Top 3 分佈')
+        ]
+        
+        for col_idx, key, title in kpi_defs_r2:
+            card = ttk.Frame(row2, style='Card.TFrame', padding=15)
+            card.grid(row=0, column=col_idx, sticky='nsew', padx=(0 if col_idx==0 else 10, 0))
+            ttk.Label(card, text=title, style='CardLabel.TLabel').pack(anchor='w')
+            val = ttk.Label(card, text="--", style='CardValue.TLabel', font=self.tm.fonts['h2'])
+            val.pack(anchor='w', pady=(5, 0))
+            self.kpi_vals[key] = val
+
+        # Chart
         chart_area = ttk.Frame(self.view_dash, style='Card.TFrame', padding=5)
         chart_area.pack(fill='both', expand=True)
-        
         nb = ttk.Notebook(chart_area)
         nb.pack(fill='both', expand=True)
         
-        # 分頁 1: 距離分佈直方圖
         f1 = ttk.Frame(nb, style='Card.TFrame')
         nb.add(f1, text="距離分佈")
         self.chart_hist = ChartManager(f1, self.tm)
         
-        # 分頁 2: F 值曲線
         f2 = ttk.Frame(nb, style='Card.TFrame')
         nb.add(f2, text="微小單節 F 值")
-        
-        # F 值控制列
         fc = ttk.Frame(f2, style='Card.TFrame', padding=5)
         fc.pack(fill='x')
-        
         ttk.Label(fc, text="L:", style='CardLabel.TLabel').pack(side='left')
         self.entry_l = ttk.Entry(fc, width=8)
         self.entry_l.pack(side='left', padx=5)
-        
         ttk.Label(fc, text="T:", style='CardLabel.TLabel').pack(side='left')
         self.entry_t = ttk.Entry(fc, width=8)
         self.entry_t.pack(side='left', padx=5)
-        
         ttk.Button(fc, text="計算", bootstyle="warning", command=self.calc_f_curve).pack(side='left')
-        
         self.chart_f = ChartManager(f2, self.tm)
 
-    def _init_table(self):
-        """初始化表格視圖"""
-        self.view_table = ttk.Frame(self.view_container)
+    def _init_detail_text(self):
+        self.view_detail = ttk.Frame(self.view_container)
         
-        # 表格控制列
-        ctrl = ttk.Frame(self.view_table)
+        ctrl = ttk.Frame(self.view_detail)
         ctrl.pack(fill='x', pady=(0, 10))
-        
         ttk.Label(ctrl, text="顯示筆數:", font=self.tm.fonts['ui']).pack(side='left')
-        # [修改] 加入 "全部" 選項
-        self.combo_limit = ttk.Combobox(ctrl, values=["1000", "5000", "10000", "全部"], width=10, state='readonly')
+        self.combo_limit = ttk.Combobox(ctrl, values=["1000", "5000", "全部"], width=10, state='readonly')
         self.combo_limit.current(0)
         self.combo_limit.pack(side='left', padx=5)
-        self.combo_limit.bind("<<ComboboxSelected>>", self.refresh_table)
-        
+        self.combo_limit.bind("<<ComboboxSelected>>", self.refresh_detail_view)
         ttk.Button(ctrl, text="匯出 CSV", bootstyle="success-outline", command=self.export_csv).pack(side='right')
         
-        # Treeview 表格
-        cols = ("No", "Start", "End", "Dist")
-        self.tree = ttk.Treeview(self.view_table, columns=cols, show='headings', selectmode='browse')
-        
-        # 設定標題 (點擊可排序)
-        for c in cols:
-            self.tree.heading(c, text=c, command=lambda _c=c: self._sort_tree(_c, False))
-            
-        self.tree.column("No", width=60, anchor='center')
-        self.tree.column("Start", width=200)
-        self.tree.column("End", width=200)
-        self.tree.column("Dist", width=100, anchor='e')
-        
-        # 捲軸
-        vsb = ttk.Scrollbar(self.view_table, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        
-        self.tree.pack(side='left', fill='both', expand=True)
-        vsb.pack(side='right', fill='y')
-
-    def _init_code(self):
-        """初始化原始碼視圖"""
-        self.view_code = ttk.Frame(self.view_container)
-        
-        # 使用 ScrolledText
-        self.txt_code = scrolledtext.ScrolledText(
-            self.view_code, 
-            font=self.tm.fonts['mono'], 
-            bg=self.colors['bg_card'],  # 背景色
-            fg=self.colors['fg_main'],  # 文字色
-            insertbackground='white',   # 游標顏色
-            relief='flat',
-            padx=10, pady=10
+        self.txt_detail = scrolledtext.ScrolledText(
+            self.view_detail, font=self.tm.fonts['mono'],
+            bg=self.colors['bg_card'], fg=self.colors['fg_main'],
+            insertbackground='white', relief='flat', padx=10, pady=10
         )
-        self.txt_code.pack(fill='both', expand=True)
+        self.txt_detail.pack(fill='both', expand=True)
+
+    def _init_log(self):
+        self.view_log = ttk.Frame(self.view_container)
+        self.txt_log = scrolledtext.ScrolledText(
+            self.view_log, font=self.tm.fonts['mono'],
+            bg=self.colors['bg_card'], fg=self.colors['fg_main'],
+            insertbackground='white', relief='flat', padx=10, pady=10
+        )
+        self.txt_log.pack(fill='both', expand=True)
 
     def switch_view(self, view):
-        """切換右側視圖"""
-        # 先隱藏所有
         self.view_dash.pack_forget()
-        self.view_table.pack_forget()
-        self.view_code.pack_forget()
-        
-        # 更新按鈕樣式 (高亮當前)
+        self.view_detail.pack_forget()
+        self.view_log.pack_forget()
         for k, btn in self.nav_btns.items():
-            if k == view:
-                btn.configure(style='NavActive.TButton')
-            else:
-                btn.configure(style='Nav.TButton')
-        
-        # 顯示目標
+            btn.configure(style=('NavActive.TButton' if k == view else 'Nav.TButton'))
         if view == 'dashboard': self.view_dash.pack(fill='both', expand=True)
-        elif view == 'table': self.view_table.pack(fill='both', expand=True)
-        elif view == 'code': self.view_code.pack(fill='both', expand=True)
-        
-        self.current_view = view
-
-    # --- 邏輯功能 ---
+        elif view == 'detail': self.view_detail.pack(fill='both', expand=True)
+        elif view == 'log': self.view_log.pack(fill='both', expand=True)
 
     def select_file(self):
         path = filedialog.askopenfilename(filetypes=[("CAM Files", "*.txt *.nc *.ncd *.tap"), ("All", "*.*")])
@@ -280,196 +253,244 @@ class CAMApp:
             self.file_path = path
             self.lbl_filename.config(text=os.path.basename(path))
             self.btn_analyze.config(state='normal')
+            self.status_var.set("已載入，等待分析")
             
-            # 重置 UI 數據
-            self.kpi_vals['total'].config(text="--")
-            self.kpi_vals['g01'].config(text="--")
-            self.kpi_vals['g00'].config(text="--")
+            for k in self.kpi_vals: self.kpi_vals[k].config(text="--")
             for lbl in self.axis_indicators.values(): lbl.configure(style='AxisInactive.TLabel')
+            self.txt_detail.delete(1.0, tk.END)
+            self.txt_log.delete(1.0, tk.END)
 
-    def start_analysis(self):
+    def start_analysis_thread(self):
         if self.is_running: return
         self.is_running = True
         self.should_stop = False
         self.is_paused = False
         
-        # 鎖定按鈕
         self.btn_analyze.config(state='disabled')
         self.btn_open.config(state='disabled')
         self.btn_pause.config(state='normal', text="暫停")
         self.btn_stop.config(state='normal')
         
-        # 清空舊資料
-        self.txt_code.delete(1.0, tk.END)
-        for i in self.tree.get_children(): self.tree.delete(i)
+        self.txt_log.delete(1.0, tk.END)
+        self.txt_detail.delete(1.0, tk.END)
+        self.txt_log.insert(tk.END, "正在啟動分析核心...\n")
         
+        thread = threading.Thread(target=self.run_analysis)
+        thread.daemon = True
+        thread.start()
+
+    def run_analysis(self):
         try:
             content = ""
-            for chunk in self.engine.read_file_generator(self.file_path, progress_callback=self.progress_callback):
+            for chunk in self.engine.read_file_generator(self.file_path, progress_callback=self.thread_callback):
                 content += chunk
                 if self.should_stop: break
             
             if self.should_stop: raise InterruptedError("使用者停止")
 
-            data = self.engine.parse_and_calculate(content, self.progress_callback)
+            data = self.engine.parse_and_calculate(content, self.thread_callback)
             if not data: raise InterruptedError("停止")
             
-            self.detected_axes = data["axes"]
-            self.skipped_lines = data["skipped"]
-            self.stats["g00"] = data["g00_dist"]
+            dists, total_dist, total_time, top10, top3, bpt = self.engine.calculate_metrics_and_stats(
+                data, self.bins, self.fixed_intervals, self.thread_callback
+            )
             
-            # 更新燈號
-            for ax in self.detected_axes:
-                self.axis_indicators[ax].configure(style='AxisActive.TLabel')
+            if dists is None: raise InterruptedError("停止")
 
-            self.cached_starts = data["starts"]
-            self.cached_ends = data["ends"]
-            if not self.cached_starts: raise InterruptedError("無有效 G01 移動")
-
-            self.cached_distances, total_g01 = self.engine.calculate_g01_metrics(data, self.progress_callback)
-            
-            if self.cached_distances is None: raise InterruptedError("停止")
-
-            self.stats["g01"] = total_g01
-            
-            # 更新儀表板數據
-            total = self.stats["g00"] + total_g01
-            g01_pct = (total_g01 / total * 100) if total > 0 else 0
-            g00_pct = (self.stats["g00"] / total * 100) if total > 0 else 0
-            
-            self.kpi_vals['total'].config(text=f"{total:,.2f} mm")
-            self.kpi_vals['g01'].config(text=f"{total_g01:,.2f} mm ({g01_pct:.1f}%)")
-            self.kpi_vals['g00'].config(text=f"{self.stats['g00']:,.2f} mm ({g00_pct:.1f}%)")
-            
-            # 填入表格
-            self.refresh_table()
-            
-            # [修改] 填入 Log (原始碼)，顯示全部
-            self.txt_code.insert(tk.END, "=== 略過/指令列表 (全部) ===\n\n")
-            for l in self.skipped_lines:
-                self.txt_code.insert(tk.END, l + "\n")
-                
-            # 繪圖
-            self.chart_hist.plot_histogram(self.cached_distances, self.bins, self.fixed_intervals)
-            # 預設計算一次 F Curve (如果有值)
-            if self.entry_l.get() and self.entry_t.get():
-                self.calc_f_curve()
-            
-            # 完成後切回儀表板
-            self.switch_view('dashboard')
+            result_payload = {
+                "axes": data["axes"],
+                "skipped": data["skipped"],
+                "g00": data["g00_dist"],
+                "g01": total_dist,
+                "time": total_time,
+                "dists": dists,
+                "detailed_logs": data["detailed_logs"],
+                "top10": top10,
+                "top3": top3,
+                "bpt": bpt
+            }
+            self.msg_queue.put(("DONE", result_payload))
 
         except InterruptedError:
-            pass # 靜默停止
+            self.msg_queue.put(("STATUS", "已取消"))
         except Exception as e:
-            messagebox.showerror("錯誤", str(e))
+            self.msg_queue.put(("ERROR", str(e)))
         finally:
-            self.is_running = False
-            self.btn_analyze.config(state='normal')
-            self.btn_open.config(state='normal')
-            self.btn_pause.config(state='disabled')
-            self.btn_stop.config(state='disabled')
-            self.progress['value'] = 0
-            self.root.title("CAM Analyzer Pro v4.2")
+            self.msg_queue.put(("FINISH", None))
 
-    def refresh_table(self, event=None):
-        """刷新表格數據 (支援全部顯示)"""
-        if not self.cached_starts: return
-        
-        # 清空目前表格
-        for i in self.tree.get_children(): self.tree.delete(i)
-        
-        limit_str = self.combo_limit.get()
-        if limit_str == "全部":
-            limit = len(self.cached_starts)
-        else:
-            limit = int(limit_str)
-        
-        # 決定要顯示哪些軸
-        axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
-        indices = [axis_map[ax] for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
-        
-        # 為了避免大量數據時 UI 卡死，我們這裡也分批插入 (可選，這裡先簡單處理)
-        # 如果數據量真的很大 (如 > 5萬筆)，建議未來可以改用 Virtual Event 延遲加載，
-        # 但目前為了符合 "全部顯示" 需求，直接插入。
-        
-        count = 0
-        for i, (s, e, d) in enumerate(zip(self.cached_starts, self.cached_ends, self.cached_distances)):
-            if count >= limit: break
-            
-            s_str = ",".join([f"{s[idx]:.2f}" for idx in indices])
-            e_str = ",".join([f"{e[idx]:.2f}" for idx in indices])
-            self.tree.insert('', 'end', values=(i+1, s_str, e_str, f"{d:.4f}"))
-            count += 1
-
-    def _sort_tree(self, col, reverse):
-        """表格排序功能"""
-        l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
-        try:
-            # 嘗試轉成浮點數排序
-            l.sort(key=lambda t: float(t[0]), reverse=reverse)
-        except ValueError:
-            # 字串排序
-            l.sort(reverse=reverse)
-            
-        for index, (val, k) in enumerate(l):
-            self.tree.move(k, '', index)
-            
-        self.tree.heading(col, command=lambda: self._sort_tree(col, not reverse))
-
-    def progress_callback(self, pct, msg):
-        self.progress['value'] = pct
-        self.root.title(f"CAM Analyzer Pro - {pct:.0f}%")
-        self.root.update_idletasks() # [修正] 確保介面刷新
-        
+    def thread_callback(self, pct, msg):
+        self.msg_queue.put(("PROGRESS", (pct, msg)))
         while self.is_paused:
-            self.root.update()
-            time.sleep(0.1)
+            self.msg_queue.put(("STATUS", "已暫停..."))
+            time.sleep(0.2)
             if self.should_stop: return True
         return self.should_stop
 
+    def check_queue(self):
+        try:
+            while True:
+                msg_type, data = self.msg_queue.get_nowait()
+                if msg_type == "PROGRESS":
+                    pct, txt = data
+                    self.progress['value'] = pct
+                    self.status_var.set(f"{txt} ({pct:.1f}%)")
+                elif msg_type == "STATUS":
+                    self.status_var.set(data)
+                elif msg_type == "DONE":
+                    self.update_results(data)
+                elif msg_type == "ERROR":
+                    messagebox.showerror("錯誤", data)
+                elif msg_type == "FINISH":
+                    self.is_running = False
+                    self.btn_analyze.config(state='normal')
+                    self.btn_open.config(state='normal')
+                    self.btn_pause.config(state='disabled')
+                    self.btn_stop.config(state='disabled')
+                    self.progress['value'] = 0
+                    if "錯誤" not in self.status_var.get():
+                        self.status_var.set("就緒")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.check_queue)
+
+    def update_results(self, data):
+        self.stats["g00"] = data["g00"]
+        self.stats["g01"] = data["g01"]
+        self.stats["time"] = data["time"]
+        self.cached_distances = data["dists"]
+        self.detected_axes = data["axes"]
+        self.detailed_logs = data["detailed_logs"]
+        self.top_10_stats = data["top10"]
+        self.top_3_stats = data["top3"]
+        
+        # 1. 軸向
+        for ax in self.detected_axes:
+            self.axis_indicators[ax].configure(style='AxisActive.TLabel')
+            
+        # 2. KPI - Row 1
+        total = self.stats["g00"] + self.stats["g01"]
+        g01_pct = (self.stats["g01"] / total * 100) if total > 0 else 0
+        g00_pct = (self.stats["g00"] / total * 100) if total > 0 else 0
+        
+        self.kpi_vals['total'].config(text=f"{total:,.2f} mm")
+        self.kpi_vals['g01'].config(text=f"{self.stats['g01']:,.2f} mm ({g01_pct:.1f}%)")
+        self.kpi_vals['g00'].config(text=f"{self.stats['g00']:,.2f} mm ({g00_pct:.1f}%)")
+        
+        total_seconds = int(self.stats["time"] * 60)
+        h, m, s = total_seconds // 3600, (total_seconds % 3600) // 60, total_seconds % 60
+        self.kpi_vals['time'].config(text=f"{h:02d}:{m:02d}:{s:02d}")
+        
+        # KPI - Row 2
+        if data['bpt']:
+            self.kpi_vals['bpt'].config(text=f"{data['bpt']['range_str']}")
+        else:
+            self.kpi_vals['bpt'].config(text="無法計算")
+
+        for i in range(3):
+            key = f'top{i+1}'
+            if i < len(self.top_3_stats):
+                item = self.top_3_stats[i]
+                self.kpi_vals[key].config(text=f"{item['label']} ({item['pct']:.1f}%)")
+            else:
+                self.kpi_vals[key].config(text="--")
+
+        # 3. Log
+        self.txt_log.insert(tk.END, "=== 分析完成: 略過(G01)/警告/指令列表 ===\n")
+        self.txt_log.insert(tk.END, "(已過濾正常 G01 移動，僅顯示非切削與異常指令)\n\n")
+        MAX_LOG = 5000
+        for i, l in enumerate(data["skipped"]):
+            if i < MAX_LOG: self.txt_log.insert(tk.END, l + "\n")
+            else: 
+                self.txt_log.insert(tk.END, f"... (隱藏 {len(data['skipped'])-MAX_LOG} 筆) ...\n")
+                break
+        
+        # 4. Detail
+        self.refresh_detail_view()
+
+        # 5. Chart
+        self.chart_hist.plot_histogram(self.cached_distances, self.bins, self.fixed_intervals)
+        if self.entry_l.get() and self.entry_t.get():
+            self.calc_f_curve()
+            
+        self.status_var.set("分析完成")
+        self.switch_view('dashboard')
+
+    def refresh_detail_view(self, event=None):
+        if not self.detailed_logs: return
+        self.txt_detail.delete(1.0, tk.END)
+        
+        self.txt_detail.insert(tk.END, "=== Top 10 Distribution Stats ===\n")
+        for i, item in enumerate(self.top_10_stats):
+            bar = "|" * int(item['pct'] / 2)
+            self.txt_detail.insert(tk.END, f"{i+1:2d}. {item['label']:<15} | Cnt:{item['count']:<5} | {item['pct']:5.1f}% | AvgF:{int(item['avg_feed'])} | {bar}\n")
+        self.txt_detail.insert(tk.END, "="*90 + "\n\n")
+
+        limit_str = self.combo_limit.get()
+        limit = len(self.detailed_logs) if limit_str == "全部" else int(limit_str)
+        
+        # 動態表頭: Start/End 根據偵測到的軸向顯示
+        active_axes_str = "".join(self.detected_axes)
+        header_start = f"Start ({active_axes_str})"
+        header_end = f"End ({active_axes_str})"
+        
+        self.txt_detail.insert(tk.END, f"{'Line':<6} | {header_start:<25} | {header_end:<25} | {'Dist':<8} | {'Feed':<6} | {'Info'}\n")
+        self.txt_detail.insert(tk.END, "-"*100 + "\n")
+        
+        axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
+        active_indices = [axis_map[ax] for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
+        
+        count = 0
+        buffer = ""
+        for log in self.detailed_logs:
+            if count >= limit: break
+            s_str = " ".join([f"{log['start'][i]:.1f}" for i in active_indices])
+            e_str = " ".join([f"{log['end'][i]:.1f}" for i in active_indices])
+            buffer += f"{log['line']:<6} | {s_str:<25} | {e_str:<25} | {log['dist']:<8.3f} | {int(log['feed']):<6} | {log['info']}\n"
+            count += 1
+            if count % 500 == 0:
+                self.txt_detail.insert(tk.END, buffer)
+                buffer = ""
+                self.root.update_idletasks()
+        if buffer: self.txt_detail.insert(tk.END, buffer)
+
     def calc_f_curve(self):
         try:
-            if not hasattr(self, 'cached_distances') or not self.cached_distances: return
+            if not self.cached_distances: return
             l_val = self.entry_l.get()
             t_val = self.entry_t.get()
             if not l_val or not t_val: return
-            
             x, f = self.engine.calculate_f_values(self.cached_distances, float(t_val))
             hist = getattr(self, 'hist_data', None)
             self.chart_f.plot_f_curve(x, f, float(t_val), max(self.cached_distances), hist, self.fixed_intervals)
         except ValueError: pass
 
     def export_csv(self):
-        if not self.cached_starts: return
+        if not self.detailed_logs: return
         path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if not path: return
-        try:
-            with open(path, 'w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
-                writer.writerow(["=== CAM Analyzer Report ==="])
-                writer.writerow(["Total Dist", self.kpi_vals['total'].cget("text")])
-                writer.writerow(["G01 Dist", self.kpi_vals['g01'].cget("text")])
-                writer.writerow(["G00 Dist", self.kpi_vals['g00'].cget("text")])
-                writer.writerow([])
-                
-                axes = [ax for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
-                header = ["No"] + [f"Start_{a}" for a in axes] + [f"End_{a}" for a in axes] + ["Dist"]
-                writer.writerow(header)
-                
-                axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
-                indices = [axis_map[ax] for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
-                
-                rows = []
-                for i, (s, e, d) in enumerate(zip(self.cached_starts, self.cached_ends, self.cached_distances)):
-                    s_v = [s[idx] for idx in indices]
-                    e_v = [e[idx] for idx in indices]
-                    rows.append([i+1] + s_v + e_v + [f"{d:.5f}"])
-                    if len(rows) >= 5000:
-                        writer.writerows(rows)
-                        rows = []
-                if rows: writer.writerows(rows)
-            messagebox.showinfo("成功", "匯出完成")
-        except Exception as e: messagebox.showerror("失敗", str(e))
+        
+        def _export():
+            try:
+                self.msg_queue.put(("STATUS", "正在匯出 CSV..."))
+                with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    active_axes = [ax for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
+                    s_headers = [f"Start_{ax}" for ax in active_axes]
+                    e_headers = [f"End_{ax}" for ax in active_axes]
+                    writer.writerow(["Line"] + s_headers + e_headers + ["Dist", "Feed", "Info"])
+                    axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
+                    idxs = [axis_map[ax] for ax in active_axes]
+                    rows = []
+                    for l in self.detailed_logs:
+                        s_v = [l['start'][i] for i in idxs]
+                        e_v = [l['end'][i] for i in idxs]
+                        rows.append([l['line']] + s_v + e_v + [l['dist'], l['feed'], l['info']])
+                    writer.writerows(rows)
+                self.msg_queue.put(("STATUS", "匯出完成"))
+                messagebox.showinfo("成功", "匯出完成")
+            except Exception as e:
+                messagebox.showerror("失敗", str(e))
+        threading.Thread(target=_export).start()
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
@@ -481,5 +502,4 @@ class CAMApp:
     def on_closing(self):
         self.should_stop = True
         self.root.destroy()
-    
     def on_resize(self, event): pass

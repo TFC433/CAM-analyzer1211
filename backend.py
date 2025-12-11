@@ -7,12 +7,12 @@ import math
 class GCodeAnalyzer:
     """
     負責處理 G-code 檔案讀取、解析與數學運算的後端核心。
-    v3.3: 支援運算分批處理以優化 UI 響應 (暫停/停止功能)
+    v7.3: Top 統計單位優化(um)、動態表頭支援、BPT 格式調整、Log 過濾。
     """
     
     def __init__(self):
-        # Regex: 抓軸名 + 數值 (支援 .5 或 -.123)
-        self.pattern = re.compile(r'([XYZABC])([-+]?(?:\d+\.?\d*|\.\d+))', re.IGNORECASE)
+        # Regex: 抓軸名 (XYZABC), 圓弧參數 (R), 進給 (F)
+        self.pattern = re.compile(r'([XYZABCFR])([-+]?(?:\d+\.?\d*|\.\d+))', re.IGNORECASE)
 
     def detect_encoding(self, file_path):
         try:
@@ -34,6 +34,7 @@ class GCodeAnalyzer:
                     if not chunk:
                         break
                     processed_bytes += len(chunk.encode(encoding))
+                    
                     if progress_callback:
                         if progress_callback((processed_bytes / file_size) * 100, "正在讀取檔案"):
                             return None
@@ -44,22 +45,23 @@ class GCodeAnalyzer:
     def parse_and_calculate(self, gcode_content, progress_callback=None):
         """
         一次性完成解析與初步計算。
+        支援 G02/G03 R 半徑計算。
+        LOG 邏輯: 略過正常的 G01，只記錄非 G01 與異常。
         """
         g01_segments_start = [] 
-        g01_segments_end = []   
-        skipped_lines = []
-        active_axes = set()
+        g01_segments_end = []
         
+        detailed_logs = [] 
+        log_lines = [] # Log 視窗顯示用
+        
+        active_axes = set()
         total_g00_dist = 0.0
         
-        # 移除括號註解
         gcode_content = re.sub(r'\([^)]*\)', '', gcode_content)
         lines = gcode_content.strip().split('\n')
         
-        # 當前座標
         current_pos = {'X': 0.0, 'Y': 0.0, 'Z': 0.0, 'A': 0.0, 'B': 0.0, 'C': 0.0}
-        
-        # 狀態標記 (預設 G00)
+        current_feed = 0.0
         motion_mode = 'G00' 
         
         total_lines = len(lines)
@@ -69,140 +71,249 @@ class GCodeAnalyzer:
             line = line.strip()
             line_upper = line.upper()
             
-            # 定期回報進度，讓 UI 有機會響應暫停/停止
             if i % 2000 == 0 and progress_callback:
                 if progress_callback((i / total_lines) * 100, "正在解析與計算"):
                     return None
             
-            if not line:
-                skipped_lines.append(f"Line {i+1}: (空行)")
-                continue
+            if not line: continue
 
-            # 1. 更新模態 (Motion Mode)
-            if 'G00' in line_upper:
-                motion_mode = 'G00'
-            elif 'G01' in line_upper:
-                motion_mode = 'G01'
-            elif 'G02' in line_upper:
-                motion_mode = 'G02'
-            elif 'G03' in line_upper:
-                motion_mode = 'G03'
+            # 1. 更新模態
+            if 'G00' in line_upper: motion_mode = 'G00'
+            elif 'G01' in line_upper: motion_mode = 'G01'
+            elif 'G02' in line_upper: motion_mode = 'G02'
+            elif 'G03' in line_upper: motion_mode = 'G03'
             
-            # 2. 提取座標
+            # 2. 提取參數
             coords = pattern_findall(line)
-            has_coords = len(coords) > 0
-
-            # 如果沒有座標，進行純指令分類記錄
-            if not has_coords:
-                if 'M' in line_upper:
-                    skipped_lines.append(f"Line {i+1}: {line} [輔助功能]")
-                elif any(c in line_upper for c in ['F', 'S', 'T']):
-                    skipped_lines.append(f"Line {i+1}: {line} [參數設定]")
-                elif line_upper.startswith('G'):
-                    skipped_lines.append(f"Line {i+1}: {line} [準備機能]")
-                elif line_upper.startswith(('%', 'O')):
-                    skipped_lines.append(f"Line {i+1}: {line} [程式頭/註解]")
-                else:
-                    skipped_lines.append(f"Line {i+1}: {line} [無座標資訊]")
-                continue
-
-            # 3. 計算潛在的移動
+            has_coords = False
+            
             next_pos = current_pos.copy()
+            radius_r = None 
+            
             for axis, val_str in coords:
                 axis = axis.upper()
                 try:
                     val = float(val_str)
-                    next_pos[axis] = val
-                    active_axes.add(axis)
+                    if axis == 'F':
+                        current_feed = val
+                    elif axis == 'R':
+                        radius_r = val
+                    elif axis in ['X', 'Y', 'Z', 'A', 'B', 'C']:
+                        next_pos[axis] = val
+                        active_axes.add(axis)
+                        has_coords = True
                 except ValueError:
                     pass
 
-            # 計算這一步的物理距離 (包含所有軸)
+            # [Log 邏輯] 非座標行
+            if not has_coords:
+                if 'F' in line_upper and current_feed > 0:
+                    log_lines.append(f"Line {i+1}: {line} [設定進給]")
+                elif 'M' in line_upper:
+                    log_lines.append(f"Line {i+1}: {line} [輔助功能 M]")
+                elif any(x in line_upper for x in ['S', 'T']):
+                    log_lines.append(f"Line {i+1}: {line} [刀具/轉速]")
+                elif line_upper.startswith('G'):
+                    log_lines.append(f"Line {i+1}: {line} [準備機能 G]")
+                elif line_upper.startswith(('%', 'O')):
+                    log_lines.append(f"Line {i+1}: {line} [程式頭]")
+                else:
+                    log_lines.append(f"Line {i+1}: {line} [無座標資訊]")
+                continue
+
+            # 3. 計算基礎直線距離
             p_curr = [current_pos[ax] for ax in 'XYZABC']
             p_next = [next_pos[ax] for ax in 'XYZABC']
-            dist = math.sqrt(sum((n - c) ** 2 for n, c in zip(p_next, p_curr)))
+            linear_dist = math.sqrt(sum((n - c) ** 2 for n, c in zip(p_next, p_curr)))
             
-            # 4. 根據當前模式決定如何處理
+            actual_dist = linear_dist
+            note = ""
+            log_suffix = ""
+            should_log = True 
+
+            # 4. 根據模式處理
             if motion_mode == 'G00':
-                total_g00_dist += dist
+                total_g00_dist += actual_dist
+                log_suffix = "[快速定位 G00]"
                 current_pos = next_pos
-                skipped_lines.append(f"Line {i+1}: {line} [快速定位 G00]")
             
             elif motion_mode == 'G01':
-                if dist > 0.000001: 
+                if linear_dist > 0.000001:
+                    use_feed = current_feed if current_feed > 0 else 1000.0
+                    
+                    if current_feed <= 0:
+                        log_suffix = "[警告: G01 無 F 值]"
+                        should_log = True 
+                    else:
+                        should_log = False # 正常 G01 不記錄
+                    
                     g01_segments_start.append(p_curr)
                     g01_segments_end.append(p_next)
+                    
+                    note = f"G01 F{int(use_feed)}"
+                    detailed_logs.append({
+                        'line': i+1,
+                        'start': p_curr,
+                        'end': p_next,
+                        'dist': linear_dist,
+                        'feed': use_feed,
+                        'info': note
+                    })
                     current_pos = next_pos
                 else:
-                    skipped_lines.append(f"Line {i+1}: {line} [G01 原地停留 (dist=0)]")
-                    current_pos = next_pos 
+                    log_suffix = "[G01 停滯]"
+                    should_log = True
+                    current_pos = next_pos
 
             elif motion_mode in ['G02', 'G03']:
+                if linear_dist > 0.000001 and radius_r is not None:
+                    try:
+                        abs_r = abs(radius_r)
+                        if linear_dist <= 2 * abs_r:
+                            theta = 2 * math.asin(linear_dist / (2 * abs_r))
+                            if radius_r < 0: theta = 2 * math.pi - theta 
+                            
+                            arc_len = abs_r * theta
+                            actual_dist = arc_len
+                            note = f"{motion_mode} R{radius_r} (Arc)"
+                            log_suffix = f"[{motion_mode} 圓弧]"
+                        else:
+                            note = f"{motion_mode} R錯誤"
+                            log_suffix = f"[警告: {motion_mode} R錯誤]"
+                    except:
+                        note = f"{motion_mode} 計算錯誤"
+                        log_suffix = "[警告: 弧長計算失敗]"
+                else:
+                    note = f"{motion_mode} (直線近似)"
+                    log_suffix = f"[{motion_mode} 無R值近似]"
+                
+                should_log = True 
+                
+                if actual_dist > 0.000001:
+                    use_feed = current_feed if current_feed > 0 else 1000.0
+                    g01_segments_start.append(p_curr)
+                    g01_segments_end.append(p_next)
+                    
+                    detailed_logs.append({
+                        'line': i+1,
+                        'start': p_curr,
+                        'end': p_next,
+                        'dist': actual_dist, 
+                        'feed': use_feed,
+                        'info': note
+                    })
+                
                 current_pos = next_pos
-                skipped_lines.append(f"Line {i+1}: {line} [圓弧指令 (已更新座標)]")
+            
+            if should_log:
+                log_lines.append(f"Line {i+1}: {line} {log_suffix}")
 
-            else:
-                current_pos = next_pos
-                skipped_lines.append(f"Line {i+1}: {line} [座標設定]")
-
-        # 整理偵測到的軸
         final_axes = sorted(list(active_axes.union({'X', 'Y', 'Z'})))
         
         return {
             "starts": g01_segments_start,
             "ends": g01_segments_end,
-            "skipped": skipped_lines,
+            "skipped": log_lines,
             "axes": final_axes,
-            "g00_dist": total_g00_dist
+            "g00_dist": total_g00_dist,
+            "detailed_logs": detailed_logs
         }
 
-    def calculate_g01_metrics(self, data_dict, progress_callback=None):
-        """
-        使用 NumPy 分批計算 G01 相關數據，解決介面凍結問題。
-        """
-        starts = data_dict["starts"]
-        ends = data_dict["ends"]
-        active_axes_list = data_dict["axes"]
+    def calculate_metrics_and_stats(self, data_dict, bins, fixed_intervals, progress_callback=None):
+        detailed_logs = data_dict["detailed_logs"]
         
-        if not starts:
-            return [], 0.0
+        if not detailed_logs:
+            return [], 0.0, 0.0, [], [], None
 
-        # 轉換為 NumPy 陣列
-        np_starts = np.array(starts, dtype=np.float64)
-        np_ends = np.array(ends, dtype=np.float64)
-        
-        # 決定計算軸向索引
-        axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
-        indices = [axis_map[ax] for ax in active_axes_list if ax in axis_map]
-        
-        # 篩選軸向
-        p_s = np_starts[:, indices]
-        p_e = np_ends[:, indices]
-        
-        # 分批計算 (Chunk Processing)
-        total_points = p_s.shape[0]
-        chunk_size = 10000 # 每次計算 10000 點
+        # 1. 拆分數據
         all_distances = []
-        total_g01_dist = 0.0
+        all_feeds = []
         
-        for i in range(0, total_points, chunk_size):
-            # 檢查是否需要暫停/停止
-            if progress_callback:
-                pct = (i / total_points) * 100
-                if progress_callback(pct, f"正在計算距離 ({i}/{total_points})"):
-                    return None, None
+        total_dist = 0.0
+        total_time_min = 0.0
+        
+        total_steps = len(detailed_logs)
+        
+        for i, log in enumerate(detailed_logs):
+            if i % 10000 == 0 and progress_callback:
+                 if progress_callback((i / total_steps) * 100, "正在加總數據"):
+                    return None, None, None, None, None, None
             
-            # 取得目前的批次
-            chunk_s = p_s[i : i + chunk_size]
-            chunk_e = p_e[i : i + chunk_size]
+            d = log['dist']
+            f = log['feed']
+            all_distances.append(d)
+            all_feeds.append(f)
             
-            diffs = chunk_e - chunk_s
-            dists = np.linalg.norm(diffs, axis=1)
+            total_dist += d
+            if f > 0:
+                total_time_min += (d / f)
+        
+        np_dists = np.array(all_distances)
+        np_feeds = np.array(all_feeds)
+
+        # 2. 生成 Top N 統計
+        bin_indices = np.digitize(np_dists, bins)
+        bin_counts = np.bincount(bin_indices, minlength=len(bins)+2)
+        bin_feed_sums = np.bincount(bin_indices, weights=np_feeds, minlength=len(bins)+2)
+
+        stats_list = []
+        total_count = len(all_distances)
+        
+        for i, (s, e) in enumerate(fixed_intervals):
+            bin_idx = i + 1
+            if bin_idx >= len(bin_counts): break
             
-            all_distances.extend(dists.tolist())
-            total_g01_dist += np.sum(dists)
+            count = bin_counts[bin_idx]
+            if count == 0: continue
             
-        return all_distances, total_g01_dist
+            total_f = bin_feed_sums[bin_idx]
+            avg_f = total_f / count if count > 0 else 1000.0
+            
+            # [單位優化] 轉換邏輯: < 1.0mm 轉 um
+            def fmt_val(v):
+                if v == float('inf'): return "inf"
+                if v < 1.0: return f"{v*1000:.0f}um"
+                return f"{v:.3f}mm"
+
+            s_label = fmt_val(s)
+            
+            if e == float('inf'): 
+                label = f"> {s_label}"
+            else:
+                e_label = fmt_val(e)
+                label = f"{s_label} ~ {e_label}"
+            
+            pct = (count / total_count) * 100
+            
+            stats_list.append({
+                'label': label,
+                'count': count,
+                'pct': pct,
+                'avg_feed': avg_f,
+                'min_len': s,
+                'max_len': e if e != float('inf') else s * 1.5
+            })
+            
+        stats_list.sort(key=lambda x: x['count'], reverse=True)
+        
+        top_10 = stats_list[:10]
+        top_3 = stats_list[:3] 
+        
+        # 3. 計算最適合 BPT
+        bpt_info = None
+        if stats_list:
+            top1 = stats_list[0]
+            f_avg = top1['avg_feed']
+            if f_avg > 0:
+                min_bpt = (top1['min_len'] / f_avg) * 60000
+                max_bpt = (top1['max_len'] / f_avg) * 60000
+                # [單位優化] BPT 加上 ms
+                bpt_info = {
+                    'range_str': f"{min_bpt:.2f}ms ~ {max_bpt:.2f}ms",
+                    'f_avg': f_avg
+                }
+        
+        return all_distances, total_dist, total_time_min, top_10, top_3, bpt_info
 
     def calculate_histogram_data(self, distances, bins):
         hist, bin_edges = np.histogram(distances, bins=bins)
