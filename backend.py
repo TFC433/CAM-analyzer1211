@@ -7,7 +7,7 @@ import math
 class GCodeAnalyzer:
     """
     負責處理 G-code 檔案讀取、解析與數學運算的後端核心。
-    v3.2: 修復圓弧斷點座標更新問題、增加 G01 零距離過濾
+    v3.3: 支援運算分批處理以優化 UI 響應 (暫停/停止功能)
     """
     
     def __init__(self):
@@ -44,7 +44,6 @@ class GCodeAnalyzer:
     def parse_and_calculate(self, gcode_content, progress_callback=None):
         """
         一次性完成解析與初步計算。
-        核心修正：遇到 G02/G03 時，雖然不計入 G01 距離，但必須更新 current_pos，避免下一段 G01 起點錯誤。
         """
         g01_segments_start = [] 
         g01_segments_end = []   
@@ -70,6 +69,7 @@ class GCodeAnalyzer:
             line = line.strip()
             line_upper = line.upper()
             
+            # 定期回報進度，讓 UI 有機會響應暫停/停止
             if i % 2000 == 0 and progress_callback:
                 if progress_callback((i / total_lines) * 100, "正在解析與計算"):
                     return None
@@ -88,7 +88,7 @@ class GCodeAnalyzer:
             elif 'G03' in line_upper:
                 motion_mode = 'G03'
             
-            # 2. 提取座標 (不管是什麼指令，只要有座標就要解析，以更新位置)
+            # 2. 提取座標
             coords = pattern_findall(line)
             has_coords = len(coords) > 0
 
@@ -99,7 +99,6 @@ class GCodeAnalyzer:
                 elif any(c in line_upper for c in ['F', 'S', 'T']):
                     skipped_lines.append(f"Line {i+1}: {line} [參數設定]")
                 elif line_upper.startswith('G'):
-                    # 可能是 G90, G54 等 setup 指令
                     skipped_lines.append(f"Line {i+1}: {line} [準備機能]")
                 elif line_upper.startswith(('%', 'O')):
                     skipped_lines.append(f"Line {i+1}: {line} [程式頭/註解]")
@@ -125,31 +124,24 @@ class GCodeAnalyzer:
             
             # 4. 根據當前模式決定如何處理
             if motion_mode == 'G00':
-                # G00: 累加總長，更新位置
                 total_g00_dist += dist
                 current_pos = next_pos
                 skipped_lines.append(f"Line {i+1}: {line} [快速定位 G00]")
             
             elif motion_mode == 'G01':
-                # [關鍵修正] G01 零距離過濾
                 if dist > 0.000001: 
                     g01_segments_start.append(p_curr)
                     g01_segments_end.append(p_next)
-                    # 只有有效移動才更新位置 (其實更不更新沒差，因為 next_pos 是一樣的)
                     current_pos = next_pos
                 else:
-                    # 雖然是 G01 但沒有移動 (原地停留)，不加入計算列表
                     skipped_lines.append(f"Line {i+1}: {line} [G01 原地停留 (dist=0)]")
-                    current_pos = next_pos # 座標還是要更新，以防萬一格式寫法差異
+                    current_pos = next_pos 
 
             elif motion_mode in ['G02', 'G03']:
-                # [關鍵修正] 圓弧指令：不加入 G01 計算，但 **必須更新 current_pos**
-                # 這樣下一行 G01 才會從圓弧的終點開始算，而不是從圓弧起點跳過去
                 current_pos = next_pos
                 skipped_lines.append(f"Line {i+1}: {line} [圓弧指令 (已更新座標)]")
 
             else:
-                # 其他帶有座標的指令 (如 G92 設定座標, G54 等)，視為 Setup
                 current_pos = next_pos
                 skipped_lines.append(f"Line {i+1}: {line} [座標設定]")
 
@@ -166,7 +158,7 @@ class GCodeAnalyzer:
 
     def calculate_g01_metrics(self, data_dict, progress_callback=None):
         """
-        使用 NumPy 高速計算 G01 相關數據
+        使用 NumPy 分批計算 G01 相關數據，解決介面凍結問題。
         """
         starts = data_dict["starts"]
         ends = data_dict["ends"]
@@ -175,8 +167,7 @@ class GCodeAnalyzer:
         if not starts:
             return [], 0.0
 
-        if progress_callback and progress_callback(10, "正在進行矩陣運算"): return None, None
-
+        # 轉換為 NumPy 陣列
         np_starts = np.array(starts, dtype=np.float64)
         np_ends = np.array(ends, dtype=np.float64)
         
@@ -184,16 +175,34 @@ class GCodeAnalyzer:
         axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
         indices = [axis_map[ax] for ax in active_axes_list if ax in axis_map]
         
-        # 篩選軸向 (照舊：偵測到什麼軸就算什麼軸)
+        # 篩選軸向
         p_s = np_starts[:, indices]
         p_e = np_ends[:, indices]
         
-        diffs = p_e - p_s
-        distances = np.linalg.norm(diffs, axis=1)
+        # 分批計算 (Chunk Processing)
+        total_points = p_s.shape[0]
+        chunk_size = 10000 # 每次計算 10000 點
+        all_distances = []
+        total_g01_dist = 0.0
         
-        total_g01_dist = np.sum(distances)
-        
-        return distances.tolist(), total_g01_dist
+        for i in range(0, total_points, chunk_size):
+            # 檢查是否需要暫停/停止
+            if progress_callback:
+                pct = (i / total_points) * 100
+                if progress_callback(pct, f"正在計算距離 ({i}/{total_points})"):
+                    return None, None
+            
+            # 取得目前的批次
+            chunk_s = p_s[i : i + chunk_size]
+            chunk_e = p_e[i : i + chunk_size]
+            
+            diffs = chunk_e - chunk_s
+            dists = np.linalg.norm(diffs, axis=1)
+            
+            all_distances.extend(dists.tolist())
+            total_g01_dist += np.sum(dists)
+            
+        return all_distances, total_g01_dist
 
     def calculate_histogram_data(self, distances, bins):
         hist, bin_edges = np.histogram(distances, bins=bins)

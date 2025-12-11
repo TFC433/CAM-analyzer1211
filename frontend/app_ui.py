@@ -4,6 +4,7 @@ import ttkbootstrap as ttk
 import os
 import numpy as np
 import csv
+import time  # [修正] 補上 time，用於暫停功能
 
 from backend import GCodeAnalyzer
 from frontend.styles import ThemeManager
@@ -12,7 +13,7 @@ from frontend.charts import ChartManager
 class CAMApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CAM Analyzer Pro v4.1")
+        self.root.title("CAM Analyzer Pro v4.2")
         
         # 1. 初始化樣式與色票
         self.tm = ThemeManager(root)
@@ -67,7 +68,6 @@ class CAMApp:
         # 操作區 (Actions)
         ttk.Label(self.sidebar, text="操作", style='Inverse.TLabel', font=self.tm.fonts['h2']).pack(anchor='w', pady=(0, 10))
         
-        # [修正] 改用 bootstyle 確保顏色顯示正常
         self.btn_open = ttk.Button(self.sidebar, text="📂 開啟檔案", bootstyle="success", command=self.select_file)
         self.btn_open.pack(fill='x', pady=5)
         
@@ -79,7 +79,6 @@ class CAMApp:
         ctrl_frame = ttk.Frame(self.sidebar, style='Sidebar.TFrame')
         ctrl_frame.pack(fill='x', pady=5)
         
-        # [修正] 使用 bootstyle="warning" 和 "danger" 確保按鈕有顏色
         self.btn_pause = ttk.Button(ctrl_frame, text="暫停", bootstyle="warning", width=4, 
                                     state='disabled', command=self.toggle_pause)
         self.btn_pause.pack(side='left', fill='x', expand=True, padx=(0, 2))
@@ -105,25 +104,29 @@ class CAMApp:
         self.content = ttk.Frame(self.root, padding=20)
         self.content.grid(row=0, column=1, sticky='nsew')
         
-        # 頂部狀態列 (Header)
+        # [修改] 頂部狀態列 (Header) 佈局調整
         header_frame = ttk.Frame(self.content)
         header_frame.pack(fill='x', pady=(0, 20))
         
-        self.lbl_filename = ttk.Label(header_frame, text="尚未載入檔案", font=self.tm.fonts['h1'], foreground=self.colors['fg_main'])
-        self.lbl_filename.pack(side='left')
+        # 上層：檔名 + 燈號
+        info_frame = ttk.Frame(header_frame)
+        info_frame.pack(fill='x', pady=(0, 5))
+
+        self.lbl_filename = ttk.Label(info_frame, text="尚未載入檔案", font=self.tm.fonts['h1'], foreground=self.colors['fg_main'])
+        self.lbl_filename.pack(side='left', padx=(0, 15))
         
-        # 軸向燈號區
-        axis_frame = ttk.Frame(header_frame)
-        axis_frame.pack(side='right')
+        # 軸向燈號區 (移到左邊，緊接在檔名後面)
+        axis_frame = ttk.Frame(info_frame)
+        axis_frame.pack(side='left')
         self.axis_indicators = {}
         for ax in ['X', 'Y', 'Z', 'A', 'B', 'C']:
             lbl = ttk.Label(axis_frame, text=ax, style='AxisInactive.TLabel', width=3)
             lbl.pack(side='left', padx=2)
             self.axis_indicators[ax] = lbl
 
-        # [修正] 進度條：使用 bootstyle="success-striped" 確保可見度
-        self.progress = ttk.Progressbar(self.content, mode='determinate', bootstyle='success-striped')
-        self.progress.pack(fill='x', pady=(0, 10))
+        # [修改] 下層：進度條 (在檔名下方)
+        self.progress = ttk.Progressbar(header_frame, mode='determinate', bootstyle='success-striped')
+        self.progress.pack(fill='x', pady=(0, 5))
 
         # 視圖容器 (View Container)
         self.view_container = ttk.Frame(self.content)
@@ -146,7 +149,6 @@ class CAMApp:
         kpi_frame.pack(fill='x', pady=(0, 20))
         
         self.kpi_vals = {}
-        # [需求變更] 定義三個卡片：總行程, G01(含佔比), G00(含佔比)
         kpi_defs = [
             ('total', '總行程'), 
             ('g01', 'G01 切削距離 (佔比)'), 
@@ -205,7 +207,8 @@ class CAMApp:
         ctrl.pack(fill='x', pady=(0, 10))
         
         ttk.Label(ctrl, text="顯示筆數:", font=self.tm.fonts['ui']).pack(side='left')
-        self.combo_limit = ttk.Combobox(ctrl, values=["1000", "5000", "10000"], width=10, state='readonly')
+        # [修改] 加入 "全部" 選項
+        self.combo_limit = ttk.Combobox(ctrl, values=["1000", "5000", "10000", "全部"], width=10, state='readonly')
         self.combo_limit.current(0)
         self.combo_limit.pack(side='left', padx=5)
         self.combo_limit.bind("<<ComboboxSelected>>", self.refresh_table)
@@ -236,7 +239,7 @@ class CAMApp:
         """初始化原始碼視圖"""
         self.view_code = ttk.Frame(self.view_container)
         
-        # 使用 ScrolledText，並明確指定顏色，避免預設白色背景
+        # 使用 ScrolledText
         self.txt_code = scrolledtext.ScrolledText(
             self.view_code, 
             font=self.tm.fonts['mono'], 
@@ -258,8 +261,6 @@ class CAMApp:
         # 更新按鈕樣式 (高亮當前)
         for k, btn in self.nav_btns.items():
             if k == view:
-                # 這裡 NavActive 仍然使用自定義 style，因為 ttkbootstrap 的 button style 主要是顏色
-                # 我們需要改變背景色來顯示選中狀態
                 btn.configure(style='NavActive.TButton')
             else:
                 btn.configure(style='Nav.TButton')
@@ -326,9 +327,12 @@ class CAMApp:
             if not self.cached_starts: raise InterruptedError("無有效 G01 移動")
 
             self.cached_distances, total_g01 = self.engine.calculate_g01_metrics(data, self.progress_callback)
+            
+            if self.cached_distances is None: raise InterruptedError("停止")
+
             self.stats["g01"] = total_g01
             
-            # [修正] 更新儀表板數據 (Total, G01%, G00%)
+            # 更新儀表板數據
             total = self.stats["g00"] + total_g01
             g01_pct = (total_g01 / total * 100) if total > 0 else 0
             g00_pct = (self.stats["g00"] / total * 100) if total > 0 else 0
@@ -340,9 +344,9 @@ class CAMApp:
             # 填入表格
             self.refresh_table()
             
-            # 填入 Log (原始碼)
-            self.txt_code.insert(tk.END, "=== 略過/指令列表 (前 2000 行) ===\n\n")
-            for l in self.skipped_lines[:2000]:
+            # [修改] 填入 Log (原始碼)，顯示全部
+            self.txt_code.insert(tk.END, "=== 略過/指令列表 (全部) ===\n\n")
+            for l in self.skipped_lines:
                 self.txt_code.insert(tk.END, l + "\n")
                 
             # 繪圖
@@ -365,30 +369,43 @@ class CAMApp:
             self.btn_pause.config(state='disabled')
             self.btn_stop.config(state='disabled')
             self.progress['value'] = 0
+            self.root.title("CAM Analyzer Pro v4.2")
 
     def refresh_table(self, event=None):
-        """刷新表格數據 (受限於下拉選單筆數)"""
+        """刷新表格數據 (支援全部顯示)"""
         if not self.cached_starts: return
         
         # 清空目前表格
         for i in self.tree.get_children(): self.tree.delete(i)
         
-        limit = int(self.combo_limit.get())
+        limit_str = self.combo_limit.get()
+        if limit_str == "全部":
+            limit = len(self.cached_starts)
+        else:
+            limit = int(limit_str)
         
         # 決定要顯示哪些軸
         axis_map = {'X':0, 'Y':1, 'Z':2, 'A':3, 'B':4, 'C':5}
         indices = [axis_map[ax] for ax in ['X','Y','Z','A','B','C'] if ax in self.detected_axes]
         
-        for i, (s, e, d) in enumerate(zip(self.cached_starts[:limit], self.cached_ends[:limit], self.cached_distances[:limit])):
+        # 為了避免大量數據時 UI 卡死，我們這裡也分批插入 (可選，這裡先簡單處理)
+        # 如果數據量真的很大 (如 > 5萬筆)，建議未來可以改用 Virtual Event 延遲加載，
+        # 但目前為了符合 "全部顯示" 需求，直接插入。
+        
+        count = 0
+        for i, (s, e, d) in enumerate(zip(self.cached_starts, self.cached_ends, self.cached_distances)):
+            if count >= limit: break
+            
             s_str = ",".join([f"{s[idx]:.2f}" for idx in indices])
             e_str = ",".join([f"{e[idx]:.2f}" for idx in indices])
             self.tree.insert('', 'end', values=(i+1, s_str, e_str, f"{d:.4f}"))
+            count += 1
 
     def _sort_tree(self, col, reverse):
         """表格排序功能"""
         l = [(self.tree.set(k, col), k) for k in self.tree.get_children('')]
         try:
-            # 嘗試轉成浮點數排序 (處理 No 和 Dist)
+            # 嘗試轉成浮點數排序
             l.sort(key=lambda t: float(t[0]), reverse=reverse)
         except ValueError:
             # 字串排序
@@ -402,6 +419,8 @@ class CAMApp:
     def progress_callback(self, pct, msg):
         self.progress['value'] = pct
         self.root.title(f"CAM Analyzer Pro - {pct:.0f}%")
+        self.root.update_idletasks() # [修正] 確保介面刷新
+        
         while self.is_paused:
             self.root.update()
             time.sleep(0.1)
@@ -428,7 +447,6 @@ class CAMApp:
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
                 writer.writerow(["=== CAM Analyzer Report ==="])
-                # [修正] 匯出標題對應新版 KPI
                 writer.writerow(["Total Dist", self.kpi_vals['total'].cget("text")])
                 writer.writerow(["G01 Dist", self.kpi_vals['g01'].cget("text")])
                 writer.writerow(["G00 Dist", self.kpi_vals['g00'].cget("text")])
@@ -455,7 +473,6 @@ class CAMApp:
 
     def toggle_pause(self):
         self.is_paused = not self.is_paused
-        # [修正] 使用中文
         self.btn_pause.config(text="繼續" if self.is_paused else "暫停")
 
     def stop_analysis(self):
