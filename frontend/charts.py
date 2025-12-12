@@ -54,6 +54,7 @@ class ChartManager:
             self.plot_histogram(*self.last_plot_args)
 
     def plot_histogram(self, distances, bins, fixed_intervals):
+        # 儲存參數供縮放使用
         self.last_plot_args = (distances, bins, fixed_intervals)
         
         self.ax.clear()
@@ -64,11 +65,13 @@ class ChartManager:
         c_bar = self.colors['accent']
         c_star = self.colors['star']
         
-        if not distances:
+        # [修正] 支援 Numpy Array 的判斷方式
+        if distances is None or len(distances) == 0:
             self.ax.text(0.5, 0.5, '無數據', ha='center', va='center', color=c_fg)
             self.canvas.draw()
             return
 
+        # Numpy histogram 運算極快，即便是百萬筆資料也是瞬間完成
         hist, _ = np.histogram(distances, bins=bins)
         self.hist_data = hist
         
@@ -107,11 +110,11 @@ class ChartManager:
         self.ax.grid(True, axis='x', alpha=0.2, linestyle='--', color=c_grid)
 
         # 設定 X 軸範圍 (留空間給標籤)
-        max_val = max(hist) if max(hist) > 0 else 1
+        max_val = max(hist) if len(hist) > 0 and max(hist) > 0 else 1
         x_max = max_val * (1.4 * self.current_scale_hist)
         self.ax.set_xlim(0, x_max)
 
-        # [修復] 繪製 Top 10 標籤與虛線
+        # 繪製 Top 10 標籤與虛線
         for i, bar in enumerate(self.bars):
             width = bar.get_width()
             percentage = percentages[i]
@@ -130,7 +133,6 @@ class ChartManager:
             
             # 如果是 Top 10，畫虛線與排名
             if i in top_10_indices:
-                # 簡單估算文字寬度避免重疊
                 text_len_est = len(text) * (x_max * 0.025) 
                 line_start = text_x + text_len_est
                 
@@ -146,6 +148,7 @@ class ChartManager:
         self.canvas.draw()
 
     def plot_f_curve(self, x_values, f_values, t_value, max_dist, hist_data, fixed_intervals):
+        # 暫時保留此函式，雖然 UI 目前沒呼叫
         self.ax.clear()
         self.ax.set_facecolor(self.colors['bg_card'])
         
@@ -153,7 +156,7 @@ class ChartManager:
         c_grid = self.colors['grid']
         c_line = self.colors['line']
         
-        if x_values is None:
+        if x_values is None or len(x_values) == 0:
             self.ax.text(0.5, 0.5, '無效數據', ha='center', color=c_fg)
             self.canvas.draw()
             return
@@ -173,7 +176,6 @@ class ChartManager:
         self.figure.tight_layout()
         self.canvas.draw()
 
-    # [修復] 滑鼠懸停顯示單節數
     def on_hover(self, event):
         if event.inaxes != self.ax or self.bars is None:
             if self.tooltip: self.tooltip.destroy()

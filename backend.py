@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+# ------------------------------------------------------------------------------
+# Project:      CAM Analyzer
+# File:         backend.py
+# Author:       TFC-CRM
+# Created:      2025-12-12
+# Copyright:    (c) 2025 TFC-CRM. All rights reserved.
+# License:      Proprietary / Confidential
+# Description:  Core logic for high-performance G-code parsing using Numpy.
+#               Implements sparse matrix parsing and vectorized forward fill.
+# ------------------------------------------------------------------------------
+
 import re
 import os
 import numpy as np
@@ -6,23 +18,30 @@ import math
 
 class GCodeAnalyzer:
     """
-    負責處理 G-code 檔案讀取、解析與數學運算的後端核心。
-    v7.6: 支援 5軸 TCP 向量複合距離計算、動態欄位數據結構。
+    Handles G-code file reading, parsing, and geometric calculations.
+    
+    Version: 10.6 (Flagship / Numpy Float64 / English Messages)
     """
     
     def __init__(self):
-        # Regex: 抓軸名 (XYZABC), 向量/圓心 (IJK), 圓弧參數 (R), 進給 (F)
+        # Regex: Capture axes (XYZABCIJK), radius (R), and feed (F)
         self.pattern = re.compile(r'([XYZABCIJKFR])([-+]?(?:\d+\.?\d*|\.\d+))', re.IGNORECASE)
 
-    def detect_encoding(self, file_path):
+    def detect_encoding(self, file_path: str) -> str:
+        """
+        Detects the file encoding by reading the first 64KB.
+        """
         try:
             with open(file_path, 'rb') as f:
-                result = chardet.detect(f.read(1024 * 1024))
+                result = chardet.detect(f.read(65536))
             return result['encoding'] or 'utf-8'
         except Exception as e:
-            raise RuntimeError(f"無法檢測檔案編碼：{str(e)}")
+            raise RuntimeError(f"Failed to detect file encoding: {str(e)}")
 
-    def read_file_generator(self, file_path, chunk_size=16384, progress_callback=None):
+    def read_file_generator(self, file_path: str, chunk_size=1024*1024, progress_callback=None):
+        """
+        Generator that reads the file in chunks to manage memory usage.
+        """
         file_size = os.path.getsize(file_path)
         encoding = self.detect_encoding(file_path)
         processed_bytes = 0
@@ -36,342 +55,264 @@ class GCodeAnalyzer:
                     processed_bytes += len(chunk.encode(encoding))
                     
                     if progress_callback:
-                        if progress_callback((processed_bytes / file_size) * 100, "正在讀取檔案"):
-                            return None
+                        # [Modified] English Message
+                        if processed_bytes % (5 * 1024 * 1024) == 0: 
+                            if progress_callback((processed_bytes / file_size) * 100, "Reading File"):
+                                return None
                     yield chunk
         except Exception as e:
-            raise RuntimeError(f"讀取檔案失敗：{str(e)}")
+            raise RuntimeError(f"Failed to read file: {str(e)}")
 
-    def parse_and_calculate(self, gcode_content, progress_callback=None):
+    def _numpy_ffill(self, arr: np.ndarray) -> np.ndarray:
         """
-        一次性完成解析與初步計算。
-        支援 G01 TCP 向量模式 (XYZ+IJK) 與標準歐幾里得模式 (XYZABC) 自動切換。
+        Vectorized Forward Fill using Numpy.
         """
-        g01_segments_start = [] 
-        g01_segments_end = []
+        mask = np.isnan(arr)
+        # Use [:, None] to broadcast index array (N, 1) against mask (N, Cols)
+        idx = np.where(~mask, np.arange(mask.shape[0])[:, None], 0)
         
-        detailed_logs = [] 
-        log_lines = [] 
+        # Propagate the last valid index down
+        np.maximum.accumulate(idx, axis=0, out=idx)
         
-        active_axes = set()
-        total_g00_dist = 0.0
-        
-        # 去除註解
+        # Use advanced indexing to construct the filled array
+        return arr[idx, np.arange(arr.shape[1])]
+
+    def _numpy_ffill_1d(self, arr: np.ndarray) -> np.ndarray:
+        """1D array Forward Fill."""
+        mask = np.isnan(arr)
+        idx = np.where(~mask, np.arange(mask.shape[0]), 0)
+        np.maximum.accumulate(idx, out=idx)
+        return arr[idx]
+
+    def parse_and_calculate(self, gcode_content: str, progress_callback=None) -> dict:
+        """
+        Executes sparse parsing and vectorized geometric calculations.
+        """
+        # Remove comments
         gcode_content = re.sub(r'\([^)]*\)', '', gcode_content)
-        lines = gcode_content.strip().split('\n')
+        lines = gcode_content.splitlines() 
+        total_lines = len(lines)
         
-        # 狀態變數: 包含 XYZABC 和 IJK
-        # 順序對應: X, Y, Z, A, B, C, I, J, K (共9個)
-        # IJK 預設為 Z 軸方向 (0,0,1)
-        current_pos = {
-            'X': 0.0, 'Y': 0.0, 'Z': 0.0, 
-            'A': 0.0, 'B': 0.0, 'C': 0.0,
-            'I': 0.0, 'J': 0.0, 'K': 1.0
+        estimated_tokens = total_lines * 3
+        
+        # Pre-allocation (Float64)
+        buf_rows = np.zeros(estimated_tokens, dtype=np.int32)
+        buf_cols = np.zeros(estimated_tokens, dtype=np.int8)
+        buf_vals = np.zeros(estimated_tokens, dtype=np.float64) 
+        
+        # Line Properties
+        line_modes = np.full(total_lines + 1, np.nan, dtype=np.float64) 
+        line_feeds = np.full(total_lines + 1, np.nan, dtype=np.float64)
+        
+        # Initial State
+        line_modes[0] = 0.0 
+        line_feeds[0] = 0.0
+        
+        axis_map = {
+            'X':0, 'Y':1, 'Z':2, 
+            'A':3, 'B':4, 'C':5, 
+            'I':6, 'J':7, 'K':8
         }
         
-        current_feed = 0.0
-        motion_mode = 'G00' 
-        
-        # 計算模式路由 flag
+        ptr = 0
+        skipped_logs = []
         is_tcp_mode = False
         calc_mode_name = "歐幾里得距離計算法"
         
-        total_lines = len(lines)
         pattern_findall = self.pattern.findall
+        current_mode_val = 0.0 
         
+        # === 1. Sparse Parsing Loop ===
         for i, line in enumerate(lines):
-            line = line.strip()
+            line_idx = i + 1
+            if not line: continue
+            
+            if i % 20000 == 0 and progress_callback:
+                # [Modified] English Message
+                if progress_callback((i / total_lines) * 50, "Parsing G-code (Sparse)"):
+                    return None
+
             line_upper = line.upper()
             
-            if i % 2000 == 0 and progress_callback:
-                if progress_callback((i / total_lines) * 100, "正在解析與計算"):
-                    return None
+            # Modal G-code
+            if 'G0' in line_upper: 
+                if 'G00' in line_upper: current_mode_val = 0.0
+                elif 'G01' in line_upper: current_mode_val = 1.0
+                elif 'G02' in line_upper or 'G03' in line_upper: current_mode_val = 1.0 
+                line_modes[line_idx] = current_mode_val
             
-            if not line: continue
-
-            # 1. 更新模態
-            if 'G00' in line_upper: motion_mode = 'G00'
-            elif 'G01' in line_upper: motion_mode = 'G01'
-            elif 'G02' in line_upper: motion_mode = 'G02'
-            elif 'G03' in line_upper: motion_mode = 'G03'
-            
-            # 2. 提取參數
             coords = pattern_findall(line)
-            has_coords = False
             
-            next_pos = current_pos.copy()
-            radius_r = None 
+            has_move = False
+            has_ijk = False
             
-            # 暫存本行是否有 I, J, K (用於判斷是否切換 TCP 模式)
-            has_ijk_in_line = False
-            
-            for axis, val_str in coords:
-                axis = axis.upper()
-                try:
+            for axis_char, val_str in coords:
+                axis = axis_char.upper()
+                if axis in axis_map:
+                    if ptr >= len(buf_rows): 
+                        new_size = len(buf_rows) * 2
+                        buf_rows.resize(new_size, refcheck=False)
+                        buf_cols.resize(new_size, refcheck=False)
+                        buf_vals.resize(new_size, refcheck=False)
+                    
                     val = float(val_str)
-                    if axis == 'F':
-                        current_feed = val
-                    elif axis == 'R':
-                        radius_r = val
-                    elif axis in current_pos: # X,Y,Z,A,B,C,I,J,K
-                        next_pos[axis] = val
-                        active_axes.add(axis)
-                        has_coords = True
-                        if axis in ['I', 'J', 'K']:
-                            has_ijk_in_line = True
-                except ValueError:
-                    pass
-
-            # [路由邏輯] 自動偵測並切換計算模式
-            # 只有在 G01 直線插補且出現 IJK 時，才判定為 TCP 向量控制
-            if motion_mode == 'G01' and has_ijk_in_line:
-                if not is_tcp_mode:
-                    is_tcp_mode = True
-                    calc_mode_name = "TCP 向量複合距離法(IJK)"
-
-            # [Log 邏輯] 非座標行
-            if not has_coords and not has_ijk_in_line:
-                if 'F' in line_upper and current_feed > 0:
-                    log_lines.append(f"Line {i+1}: {line} [設定進給]")
-                elif 'M' in line_upper:
-                    log_lines.append(f"Line {i+1}: {line} [輔助功能 M]")
-                elif any(x in line_upper for x in ['S', 'T']):
-                    log_lines.append(f"Line {i+1}: {line} [刀具/轉速]")
-                elif line_upper.startswith('G'):
-                    log_lines.append(f"Line {i+1}: {line} [準備機能 G]")
-                elif line_upper.startswith(('%', 'O')):
-                    log_lines.append(f"Line {i+1}: {line} [程式頭]")
-                else:
-                    log_lines.append(f"Line {i+1}: {line} [無座標資訊]")
-                continue
-
-            # 3. 計算距離 (核心演算法分流)
-            actual_dist = 0.0
-            dist_xyz_only = 0.0 # 用於詳細列表顯示 (TCP模式)
-            rot_deg_val = 0.0   # 用於詳細列表顯示 (TCP模式)
-            
-            p_curr_xyz = [current_pos[ax] for ax in 'XYZ']
-            p_next_xyz = [next_pos[ax] for ax in 'XYZ']
-            
-            # --- 模式 A: TCP 向量複合距離法 (G01 + IJK) ---
-            if is_tcp_mode and motion_mode == 'G01':
-                # A. 計算刀尖 XYZ 歐幾里得距離
-                dist_xyz_only = math.sqrt(sum((n - c) ** 2 for n, c in zip(p_next_xyz, p_curr_xyz)))
-                
-                # B. 計算刀軸向量角度變化
-                # 取得 IJK 向量
-                v1 = [current_pos[ax] for ax in 'IJK']
-                v2 = [next_pos[ax] for ax in 'IJK']
-                
-                # 正規化向量 (避免 G-code 數值誤差)
-                def normalize(v):
-                    norm = math.sqrt(sum(x*x for x in v))
-                    return [x/norm for x in v] if norm > 0 else v
-                
-                v1_n = normalize(v1)
-                v2_n = normalize(v2)
-                
-                # 內積求夾角
-                dot_prod = sum(a*b for a, b in zip(v1_n, v2_n))
-                dot_prod = max(-1.0, min(1.0, dot_prod)) # 限制範圍
-                
-                theta_rad = math.acos(dot_prod)
-                rot_deg_val = math.degrees(theta_rad) # 轉換成角度 (1度 = 1mm 代價)
-                
-                # C. 複合距離 (不省略任何移動)
-                actual_dist = math.sqrt(dist_xyz_only**2 + rot_deg_val**2)
-                
-            # --- 模式 B: 標準歐幾里得算法 (XYZABC) ---
-            else:
-                p_curr_all = [current_pos[ax] for ax in 'XYZABC']
-                p_next_all = [next_pos[ax] for ax in 'XYZABC']
-                actual_dist = math.sqrt(sum((n - c) ** 2 for n, c in zip(p_next_all, p_curr_all)))
-                # 在此模式下，dist_xyz_only 和 rot_deg_val 保持 0 或無需顯示
-
-            # G00 處理
-            if motion_mode == 'G00':
-                dist_g00 = math.sqrt(sum((n - c) ** 2 for n, c in zip(p_next_xyz, p_curr_xyz)))
-                actual_dist = dist_g00
-
-            note = ""
-            log_suffix = ""
-            should_log = True 
-
-            # 4. 根據模式處理 Log 與分類
-            full_pos_list_curr = [current_pos[ax] for ax in ['X','Y','Z','A','B','C','I','J','K']]
-            full_pos_list_next = [next_pos[ax] for ax in ['X','Y','Z','A','B','C','I','J','K']]
-
-            if motion_mode == 'G00':
-                total_g00_dist += actual_dist
-                log_suffix = "[快速定位 G00]"
-                current_pos = next_pos
-            
-            elif motion_mode == 'G01':
-                if actual_dist > 0.000001:
-                    use_feed = current_feed if current_feed > 0 else 1000.0
+                    buf_rows[ptr] = line_idx
+                    buf_cols[ptr] = axis_map[axis]
+                    buf_vals[ptr] = val
+                    ptr += 1
                     
-                    if current_feed <= 0:
-                        log_suffix = "[警告: G01 無 F 值]"
-                        should_log = True 
-                    else:
-                        should_log = False # 正常 G01 不記錄
+                    has_move = True
+                    if axis in ['I', 'J', 'K']: has_ijk = True
                     
-                    # Chart 只需要 XYZ 座標畫路徑
-                    g01_segments_start.append(p_curr_xyz)
-                    g01_segments_end.append(p_next_xyz)
-                    
-                    note = f"G01 F{int(use_feed)}"
-                    if is_tcp_mode:
-                        note += " (TCP)"
+                elif axis == 'F':
+                    line_feeds[line_idx] = float(val_str)
 
-                    detailed_logs.append({
-                        'line': i+1,
-                        'start': full_pos_list_curr, # 存完整 9 軸
-                        'end': full_pos_list_next,
-                        'dist': actual_dist,
-                        'feed': use_feed,
-                        'info': note,
-                        # 額外欄位供詳細列表使用
-                        'dist_xyz': dist_xyz_only,
-                        'rot_deg': rot_deg_val,
-                        'is_tcp': is_tcp_mode
-                    })
-                    current_pos = next_pos
-                else:
-                    log_suffix = "[G01 停滯]"
+            # Auto-detect TCP
+            if current_mode_val == 1.0 and has_ijk and not is_tcp_mode:
+                is_tcp_mode = True
+                calc_mode_name = "TCP 向量複合距離法(IJK)"
+            
+            # Log non-movement lines
+            if not has_move and not has_ijk:
+                log_suffix = ""
+                should_log = False
+                
+                if 'M' in line_upper:
+                    log_suffix = "[M Code]"
                     should_log = True
-                    current_pos = next_pos
-
-            elif motion_mode in ['G02', 'G03']:
-                # G02/G03 圓弧計算維持原樣 (通常 TCP 不用 G02/G03)
-                p_c = [current_pos[ax] for ax in 'XYZ']
-                p_n = [next_pos[ax] for ax in 'XYZ']
-                linear_dist_xyz = math.sqrt(sum((n - c) ** 2 for n, c in zip(p_n, p_c)))
-
-                if linear_dist_xyz > 0.000001:
-                    arc_len = linear_dist_xyz
-                    
-                    if radius_r is not None:
-                        try:
-                            abs_r = abs(radius_r)
-                            if linear_dist_xyz <= 2 * abs_r:
-                                theta = 2 * math.asin(linear_dist_xyz / (2 * abs_r))
-                                if radius_r < 0: theta = 2 * math.pi - theta 
-                                arc_len = abs_r * theta
-                                note = f"{motion_mode} R{radius_r} (Arc)"
-                                log_suffix = f"[{motion_mode} 圓弧]"
-                            else:
-                                note = f"{motion_mode} R錯誤"
-                                log_suffix = f"[警告: {motion_mode} R錯誤]"
-                        except:
-                            note = f"{motion_mode} 計算錯誤"
-                    elif has_ijk_in_line and not is_tcp_mode:
-                         # 這裡的 IJK 是圓心，非向量
-                        note = f"{motion_mode} IJK (Arc)"
-                        log_suffix = f"[{motion_mode} IJK圓弧]"
-                    else:
-                        note = f"{motion_mode} (直線近似)"
-                        log_suffix = f"[{motion_mode} 無R值近似]"
-                    
-                    actual_dist = arc_len
-                    should_log = True 
-                    
-                    use_feed = current_feed if current_feed > 0 else 1000.0
-                    g01_segments_start.append(p_curr_xyz)
-                    g01_segments_end.append(p_next_xyz)
-                    
-                    detailed_logs.append({
-                        'line': i+1,
-                        'start': full_pos_list_curr,
-                        'end': full_pos_list_next,
-                        'dist': actual_dist, 
-                        'feed': use_feed,
-                        'info': note,
-                        'dist_xyz': 0, 'rot_deg': 0, 'is_tcp': False
-                    })
+                elif any(x in line_upper for x in ['S', 'T']):
+                    log_suffix = "[Tool/Speed]"
+                    should_log = True
+                elif line_upper.startswith('G'):
+                    log_suffix = "[G Code Setup]"
+                    should_log = True
+                elif line_upper.startswith(('%', 'O')):
+                    log_suffix = "[Header]"
+                    should_log = True
                 
-                current_pos = next_pos
-            
-            if should_log:
-                log_lines.append(f"Line {i+1}: {line} {log_suffix}")
+                if should_log:
+                    skipped_logs.append(f"Line {line_idx}: {line} {log_suffix}")
 
-        final_axes = sorted(list(active_axes.union({'X', 'Y', 'Z'})))
+        # === 2. Matrix Reconstruction ===
+        # [Modified] English Message
+        if progress_callback: progress_callback(60, "Building Matrix")
+        
+        buf_rows = buf_rows[:ptr]
+        buf_cols = buf_cols[:ptr]
+        buf_vals = buf_vals[:ptr]
+        
+        matrix = np.full((total_lines + 1, 9), np.nan, dtype=np.float64)
+        matrix[0] = [0, 0, 0, 0, 0, 0, 0, 0, 1] 
+        
+        matrix[buf_rows, buf_cols] = buf_vals
+        
+        # === 3. Vectorized Fill ===
+        matrix_filled = self._numpy_ffill(matrix)
+        modes_filled = self._numpy_ffill_1d(line_modes)
+        feeds_filled = self._numpy_ffill_1d(line_feeds)
+        
+        # === 4. Vectorized Calculation ===
+        # [Modified] English Message
+        if progress_callback: progress_callback(80, "Calculating Vectors")
+        
+        delta = matrix_filled[1:] - matrix_filled[:-1]
+        dist_xyz = np.linalg.norm(delta[:, 0:3], axis=1)
+        
+        # TCP Angle Calculation
+        vec_prev = matrix_filled[:-1, 6:9]
+        vec_curr = matrix_filled[1:, 6:9]
+        
+        norm_prev = np.linalg.norm(vec_prev, axis=1, keepdims=True)
+        norm_curr = np.linalg.norm(vec_curr, axis=1, keepdims=True)
+        norm_prev[norm_prev == 0] = 1.0
+        norm_curr[norm_curr == 0] = 1.0
+        
+        vec_prev_n = vec_prev / norm_prev
+        vec_curr_n = vec_curr / norm_curr
+        
+        dot = np.einsum('ij,ij->i', vec_prev_n, vec_curr_n)
+        dot = np.clip(dot, -1.0, 1.0)
+        angles = np.degrees(np.arccos(dot))
+        
+        final_dists = np.zeros_like(dist_xyz)
+        is_g00 = (modes_filled[1:] == 0.0)
+        is_g01 = ~is_g00
+        
+        if is_tcp_mode:
+            final_dists[is_g01] = np.sqrt(dist_xyz[is_g01]**2 + angles[is_g01]**2)
+            final_dists[is_g00] = dist_xyz[is_g00]
+        else:
+            dist_abc = np.linalg.norm(delta[:, 3:6], axis=1)
+            final_dists = np.sqrt(dist_xyz**2 + dist_abc**2)
+            
+        # === 5. Statistics ===
+        total_g00 = np.sum(final_dists[is_g00])
+        total_g01 = np.sum(final_dists[is_g01])
+        
+        safe_feeds = feeds_filled[1:].copy()
+        safe_feeds[safe_feeds <= 0] = 1000.0
+        time_m = np.sum(final_dists[is_g01] / safe_feeds[is_g01])
+        
+        used_cols = np.any(matrix_filled != 0, axis=0)
+        final_axes = []
+        for char, idx in axis_map.items():
+            if used_cols[idx]: final_axes.append(char)
+        
+        line_numbers = np.arange(total_lines + 1, dtype=np.int32)
         
         return {
-            "starts": g01_segments_start,
-            "ends": g01_segments_end,
-            "skipped": log_lines,
-            "axes": final_axes,
-            "g00_dist": total_g00_dist,
-            "detailed_logs": detailed_logs,
-            "calc_mode": calc_mode_name
+            "matrix": matrix_filled,
+            "dists": final_dists,
+            "dists_xyz": dist_xyz,
+            "rots_deg": angles,
+            "feeds": feeds_filled,
+            "modes": modes_filled,
+            "lines": line_numbers,
+            "skipped": skipped_logs,
+            "axes": sorted(final_axes),
+            "g00_dist": total_g00,
+            "g01_dist": total_g01,
+            "time": time_m,
+            "calc_mode": calc_mode_name,
+            "is_tcp": is_tcp_mode
         }
 
     def calculate_metrics_and_stats(self, data_dict, bins, fixed_intervals, progress_callback=None):
-        detailed_logs = data_dict["detailed_logs"]
+        """Calculates histograms, Top N stats, and BPT."""
+        dists = data_dict['dists']
+        feeds = data_dict['feeds'] 
         
-        if not detailed_logs:
-            return [], 0.0, 0.0, [], [], None
+        valid_mask = dists > 0.000001
+        valid_dists = dists[valid_mask]
+        valid_feeds = feeds[1:][valid_mask]
+        
+        if len(valid_dists) == 0:
+            return [], 0, 0, [], [], None
 
-        # 1. 拆分數據
-        all_distances = []
-        all_feeds = []
-        
-        total_dist = 0.0
-        total_time_min = 0.0
-        
-        total_steps = len(detailed_logs)
-        
-        for i, log in enumerate(detailed_logs):
-            if i % 10000 == 0 and progress_callback:
-                 if progress_callback((i / total_steps) * 100, "正在加總數據"):
-                    return None, None, None, None, None, None
-            
-            d = log['dist']
-            f = log['feed']
-            all_distances.append(d)
-            all_feeds.append(f)
-            
-            total_dist += d
-            if f > 0:
-                total_time_min += (d / f)
-        
-        np_dists = np.array(all_distances)
-        np_feeds = np.array(all_feeds)
-
-        # 2. 生成 Top N 統計
-        bin_indices = np.digitize(np_dists, bins)
+        bin_indices = np.digitize(valid_dists, bins)
         bin_counts = np.bincount(bin_indices, minlength=len(bins)+2)
-        bin_feed_sums = np.bincount(bin_indices, weights=np_feeds, minlength=len(bins)+2)
-
+        bin_feed_sums = np.bincount(bin_indices, weights=valid_feeds, minlength=len(bins)+2)
+        
         stats_list = []
-        total_count = len(all_distances)
+        total_count = len(valid_dists)
         
         for i, (s, e) in enumerate(fixed_intervals):
             bin_idx = i + 1
             if bin_idx >= len(bin_counts): break
-            
             count = bin_counts[bin_idx]
             if count == 0: continue
             
             total_f = bin_feed_sums[bin_idx]
             avg_f = total_f / count if count > 0 else 1000.0
             
-            # [單位優化] 轉換邏輯: < 1.0mm 轉 um
+            pct = (count / total_count) * 100
+            
             def fmt_val(v):
                 if v == float('inf'): return "inf"
                 if v < 1.0: return f"{v*1000:.0f}um"
                 return f"{v:.3f}mm"
-
-            s_label = fmt_val(s)
             
-            if e == float('inf'): 
-                label = f"> {s_label}"
-            else:
-                e_label = fmt_val(e)
-                label = f"{s_label} ~ {e_label}"
-            
-            pct = (count / total_count) * 100
+            label = f"{fmt_val(s)} ~ {fmt_val(e)}" if e != float('inf') else f"> {fmt_val(s)}"
             
             stats_list.append({
                 'label': label,
@@ -379,39 +320,26 @@ class GCodeAnalyzer:
                 'pct': pct,
                 'avg_feed': avg_f,
                 'min_len': s,
-                'max_len': e if e != float('inf') else s * 1.5
+                'max_len': e
             })
             
         stats_list.sort(key=lambda x: x['count'], reverse=True)
-        
         top_10 = stats_list[:10]
-        top_3 = stats_list[:3] 
+        top_3 = stats_list[:3]
         
-        # 3. 計算最適合 BPT
         bpt_info = None
-        if stats_list:
-            top1 = stats_list[0]
+        if top_10:
+            top1 = top_10[0]
             f_avg = top1['avg_feed']
             if f_avg > 0:
                 min_bpt = (top1['min_len'] / f_avg) * 60000
-                max_bpt = (top1['max_len'] / f_avg) * 60000
-                bpt_info = {
-                    'range_str': f"{min_bpt:.2f}ms ~ {max_bpt:.2f}ms",
-                    'f_avg': f_avg
-                }
-        
-        return all_distances, total_dist, total_time_min, top_10, top_3, bpt_info
+                m_len = top1['max_len']
+                if m_len == float('inf'): m_len = top1['min_len'] * 1.5
+                max_bpt = (m_len / f_avg) * 60000
+                bpt_info = {'range_str': f"{min_bpt:.2f}ms ~ {max_bpt:.2f}ms", 'f_avg': f_avg}
+
+        return valid_dists, data_dict['g01_dist'], data_dict['time'], top_10, top_3, bpt_info
 
     def calculate_histogram_data(self, distances, bins):
         hist, bin_edges = np.histogram(distances, bins=bins)
         return hist, bin_edges
-
-    def calculate_f_values(self, distances, t_value):
-        if not distances: return None, None
-        dist_array = np.array(distances)
-        max_dist = min(np.max(dist_array), 1.0)
-        if max_dist < 0.001: max_dist = 0.001
-        
-        x_values = np.arange(0.001, max_dist + 0.001, 0.001)
-        f_values = (x_values / t_value) * 60000
-        return x_values, f_values
