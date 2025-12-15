@@ -7,7 +7,7 @@
 # Copyright:    (c) 2025 TFC-CRM. All rights reserved.
 # License:      Proprietary / Confidential
 # Description:  Main UI Controller using Tkinter & ttkbootstrap.
-#               v10.8: Compact Sidebar Layout, Fixed Logo Aspect Ratio.
+#               v10.10: Rectangular Logo & Resolution Based Scaling (Standard).
 # ------------------------------------------------------------------------------
 
 import tkinter as tk
@@ -33,7 +33,7 @@ class CAMApp:
         self.project_root = project_root
         
         self.APP_NAME = "CAM Analyzer"
-        self.APP_VERSION = "v10.8 (Final)"
+        self.APP_VERSION = "v10.10"
         self.COPYRIGHT = "Copyright © 2025 TFC-CRM. All rights reserved."
         
         self.root.title(f"{self.APP_NAME} {self.APP_VERSION}")
@@ -78,6 +78,7 @@ class CAMApp:
     def _load_image(self, filename, box_size, radius=0):
         """
         讀取圖片，等比例縮放至 box_size 內並置中，最後裁切圓角。
+        radius=0 代表不裁切圓角 (矩形顯示)
         """
         try:
             img_path = os.path.join(self.project_root, filename)
@@ -144,8 +145,9 @@ class CAMApp:
         logo_frame = ttk.Frame(self.sidebar, style='Sidebar.TFrame')
         logo_frame.pack(pady=(20, 15), anchor='center') 
         
-        # Logo 140x140, 圓形 (半徑70)
-        self.logo_img = self._load_image("logo.png", (140, 140), radius=70)
+        # [修改] 改為長方形顯示，取消圓角
+        # 原尺寸 (140, 140), radius=70 -> 改為 (210, 110), radius=0
+        self.logo_img = self._load_image("logo.png", (210, 110), radius=0)
         
         if self.logo_img:
             logo_lbl = ttk.Label(logo_frame, image=self.logo_img, background=self.colors['bg_darker'])

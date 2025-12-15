@@ -13,7 +13,7 @@ class ThemeManager:
         self.style = ttk.Style(theme='darkly')
         self.is_dark_mode = True
 
-        # [修改] 計算縮放比例
+        # [修改] 回歸原本的計算邏輯 (Resolution Based)
         self.scale_factor = self._calculate_scale_factor()
         self.font_family = self._get_system_font()
         self.fonts = self._define_fonts()
@@ -22,18 +22,19 @@ class ThemeManager:
 
     def _calculate_scale_factor(self):
         """
-        智慧縮放邏輯 v10.8:
+        縮放邏輯 (Resolution Based):
         1. 基準寬度 1920px = 1.0x
-        2. 限制最小值為 1.0 (只放大不縮小)，避免在高 DPI 筆電上字體過小。
-        3. 限制最大值為 2.5 (避免在超寬螢幕過大)。
+        2. 限制最小值為 1.0 (只放大不縮小)
+        3. 限制最大值為 2.5
         """
         try:
             screen_width = self.root.winfo_screenwidth()
             base_width = 1920.0
             
+            # 先決定比例：看螢幕寬度是 1920 的幾倍
             scale = screen_width / base_width
             
-            # [關鍵修改] max(1.0, ...) 確保不會縮小
+            # 再決定縮放範圍
             final_scale = max(1.0, min(scale, 2.5))
             return final_scale
         except:
